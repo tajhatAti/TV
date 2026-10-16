@@ -1099,13 +1099,20 @@ def request_origin(request: web.Request) -> str:
     host = (request.headers.get("X-Forwarded-Host") or "").split(",")[0].strip()
     if not host:
         host = (request.headers.get("Host") or "").split(",")[0].strip()
-    if not host:
-        return ""
-    if proto not in {"http", "https"}:
-        proto = "https" if request.scheme in {"https", ""} else request.scheme
     prefix = (request.headers.get("X-Forwarded-Prefix") or "").split(",")[0].strip()
     if prefix:
         prefix = "/" + prefix.strip("/") if prefix.strip("/") else ""
+
+    # প্রক্সি আসল Host না দিলে (127.0.0.1 পাঠালে) ব্রাউজারের Origin-ই ভরসা
+    if not host or is_private_host(host):
+        origin = (request.headers.get("Origin") or "").strip()
+        if origin.startswith(("http://", "https://")):
+            parsed = urlsplit(origin)
+            return f"{parsed.scheme}://{parsed.netloc}{prefix}".rstrip("/")
+        return ""
+
+    if proto not in {"http", "https"}:
+        proto = "https" if request.scheme in {"https", ""} else request.scheme
     return f"{proto}://{host}{prefix}"
 
 
@@ -1142,8 +1149,7 @@ async def handle_setup_save(request: web.Request) -> web.Response:
     app = request.app
     runtime = app.get(RUNTIME_KEY)
     body = await _json_body(request)
-    if not same_origin_ok(request):
-        return _detail("অনুরোধটি অন্য সাইট থেকে এসেছে — নিজের ট্যাব থেকে আবার চেষ্টা করুন।", 403)
+    note_origin(request)   # শুধু লগ — কোনো ব্লক নেই
     if not save_rate_ok(runtime):
         return _detail("একটু ধীরে — এক মিনিটে অনেকবার সেভ করা হয়েছে। একটু পরে চেষ্টা করুন।", 429)
 
@@ -1224,8 +1230,7 @@ async def handle_setup_save(request: web.Request) -> web.Response:
 async def handle_setup_menu_button(request: web.Request) -> web.Response:
     """মেনু-বাটন আবার সেট করার বাটন।"""
     app = request.app
-    if not same_origin_ok(request):
-        return _detail("অনুরোধটি অন্য সাইট থেকে এসেছে।", 403)
+    note_origin(request)
     if not app_config(app).is_configured:
         return _detail("আগে সেটআপ সেভ করুন।", 409)
     ok = await set_menu_button(app, retries=2)
@@ -1236,8 +1241,7 @@ async def handle_setup_detect_owner(request: web.Request) -> web.Response:
     """বটে যিনি /start পাঠিয়েছেন তার numeric id বের করি (OWNER_ID বসানোর জন্য)।"""
     app = request.app
     body = await _json_body(request)
-    if not same_origin_ok(request):
-        return _detail("অনুরোধটি অন্য সাইট থেকে এসেছে।", 403)
+    note_origin(request)
 
     token = str(body.get("bot_token") or "").strip() or app_config(app).bot_token
     if not re.fullmatch(r"\d{5,}:[A-Za-z0-9_\-]{20,}", token or ""):
@@ -1964,31 +1968,52 @@ def startup_config(
     return cfg, runtime, warnings
 
 
-def same_origin_ok(request: web.Request) -> bool:
-    """ব্রাউজারের CSRF আটকাই: Origin/Referer থাকলে সেটা নিজের হোস্টই হতে হবে।
-
-    কোনো অতিরিক্ত পাসওয়ার্ড/PIN লাগে না — শুধু অন্য সাইট থেকে চুপিচুপি
-    সেভ করা যাবে না। (curl/স্ক্রিপ্টে Origin থাকে না, তাই ওগুলো চলবে।)
-    """
+def _hosts_of(request: web.Request) -> set:
     hosts = set()
     for header in ("X-Forwarded-Host", "Host"):
         value = (request.headers.get(header) or "").split(",")[0].strip().lower()
         if value:
             hosts.add(value)
-    if not hosts:
+    return hosts
+
+
+def is_private_host(host: str) -> bool:
+    """127.0.0.1 / localhost / প্রাইভেট IP — হোস্টিং প্রক্সি এগুলো পাঠায়।"""
+    raw = (host or "").strip().lower()
+    if raw.startswith("["):                      # [::1]:8000 / [fe80::1]
+        name = raw.split("]")[0].lstrip("[").strip()
+    elif raw.count(":") > 1:                     # বন্ধনী ছাড়া IPv6
+        name = raw
+    else:
+        name = raw.split(":")[0].strip()
+    if not name or name in {"localhost", "127.0.0.1", "::1", "0.0.0.0"}:
         return True
+    if name.startswith(("10.", "192.168.", "169.254.", "172.16.", "172.17.", "172.18.", "172.19.")):
+        return True
+    return name.endswith((".local", ".internal"))
+
+
+def note_origin(request: web.Request) -> None:
+    """Origin/Referer মিলছে কি না শুধু লগ করি — কোনো অনুরোধ আটকাই না।
+
+    কারণ: অনেক হোস্টিং (যেমন CodeNest) প্রক্সি করে অ্যাপকে `Host: 127.0.0.1:PORT`
+    পাঠায়, কিন্তু ব্রাউজার পাঠায় আসল পাবলিক Origin — তখন কঠোর চেক দিলে
+    মালিক নিজেই আটকে যান (আগে ঠিক সেটাই হচ্ছিল)। এখানে কোনো কুকি/লগইন নেই,
+    তাই চেকটা বাড়তি নিরাপত্তাও দিত না। টোকেন যাচাই + রেট-লিমিটই যথেষ্ট।
+    """
+    hosts = _hosts_of(request)
+    if not hosts or all(is_private_host(h) for h in hosts):
+        return  # প্রক্সি হোস্ট লুকিয়েছে — মেলানোর কিছু নেই, চুপচাপ এগিয়ে যাই
     for header in ("Origin", "Referer"):
         value = (request.headers.get(header) or "").strip()
         if not value:
             continue
         netloc = (urlsplit(value).netloc or "").lower()
-        if netloc not in hosts:
-            log.warning("CSRF: %s=%s হোস্টের সাথে মেলেনি (%s)", header, netloc, sorted(hosts))
-            return False
-    return True
+        if netloc and netloc not in hosts:
+            log.info("%s=%s (হোস্ট %s) — তথ্যের জন্য লগ, আটকানো হয়নি", header, netloc, sorted(hosts))
 
 
-def save_rate_ok(runtime: Optional[Runtime], *, limit: int = 10, window: int = 60) -> bool:
+def save_rate_ok(runtime: Optional[Runtime], *, limit: int = 30, window: int = 60) -> bool:
     """খুব বেশি সেভ চাপা ঠেকাই (ভুলে অনেকবার চাপলে বা স্প্যাম হলে)।"""
     if runtime is None:
         return True

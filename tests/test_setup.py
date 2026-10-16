@@ -61,7 +61,12 @@ async def test_unconfigured_server_serves_setup_page_not_crash(fake_api, tmp_pat
         status = await (await client.get("/api/setup/status")).json()
         assert status["configured"] is False
         assert status["open_access"] is True, "কোনো PIN নেই"
-        assert status["detected_url"] == f"http://{client.host}:{client.port}"
+        # প্রক্সি হোস্ট (127.0.0.1) থেকে ভুয়া লিংক বানানো হয় না — খালি রাখা হয়
+        assert status["detected_url"] == ""
+        resp = await client.get(
+            "/api/setup/status", headers={"Origin": "https://myapp.example.com"}
+        )
+        assert (await resp.json())["detected_url"] == "https://myapp.example.com"
 
         meta = await (await client.get("/api/config")).json()
         assert meta["configured"] is False
@@ -182,27 +187,99 @@ async def test_setup_save_needs_no_pin_at_all(fake_api, tmp_path):
         await client.close()
 
 
-async def test_setup_save_blocks_cross_site_post(fake_api, tmp_path):
-    """অন্য সাইট থেকে চুপিচুপি টোকেন বদলানো যাবে না (CSRF গার্ড — কোনো PIN নয়)।"""
+async def test_setup_save_never_blocked_by_origin_header(fake_api, tmp_path):
+    """Origin মিলুক বা না মিলুক — সেভ কখনো আটকাবে না (আগে এটাই মালিককে আটকাত)।"""
     app, runtime = unconfigured_app(fake_api, tmp_path)
     client = TestClient(TestServer(app))
     await client.start_server()
     try:
-        status, data = await post(
-            client, "/api/setup/save", form(), headers={"Origin": "https://evil.example.com"}
-        )
-        assert status == 403 and "অন্য সাইট" in data["detail"]
-        status, _ = await post(
-            client, "/api/setup/save", form(), headers={"Referer": "https://evil.example.com/x"}
-        )
-        assert status == 403
-        assert not runtime.config_path.exists(), "cross-site অনুরোধে কিছুই সেভ হবে না"
-
-        # নিজের হোস্ট থেকে (বা curl-এর মতো Origin ছাড়া) অনুরোধ ঠিক চলবে
-        status, _ = await post(client, "/api/setup/save", form(), headers={"Origin": f"http://{client.host}:{client.port}"})
-        assert status == 200
+        for headers in (
+            {"Origin": "https://evil.example.com"},                     # অন্য সাইট
+            {"Referer": "https://evil.example.com/x"},
+            {},                                                          # curl-এর মতো
+            {"Origin": "https://codenestauth.onrender.com"},             # প্রক্সি করা হোস্ট
+        ):
+            status, data = await post(client, "/api/setup/save", form(), headers=headers)
+            assert status == 200 and data["status"] == "saved", (headers, data)
+        assert runtime.config_path.exists()
     finally:
         await client.close()
+
+
+async def test_setup_save_works_when_proxy_rewrites_host(fake_api, tmp_path):
+    """CodeNest-এর মতো প্রক্সি: Host=127.0.0.1, ব্রাউজার Origin=পাবলিক https — সেভ হবে।"""
+    app, runtime = unconfigured_app(fake_api, tmp_path)
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        headers = {
+            "Host": "127.0.0.1:11002",                    # প্রক্সি যা পাঠায়
+            "Origin": "https://codenestauth.onrender.com",  # ব্রাউজার যা পাঠায়
+            "Referer": "https://codenestauth.onrender.com/live/u3-verify-ec07a8/",
+        }
+        prefixed = "https://codenestauth.onrender.com/live/u3-verify-ec07a8/"
+        status, data = await post(client, "/api/setup/save", form(webapp_url=prefixed), headers=headers)
+        assert status == 200 and data["status"] == "saved", data
+        assert botmod.app_config(app).webapp_url == prefixed.rstrip("/")
+        assert data["polling"] is True and data["menu_button"] is True
+        assert fake_api.params_of("setChatMenuButton")[-1]["menu_button"]["web_app"]["url"] == prefixed.rstrip("/")
+
+        # OWNER_ID বের করার বাটনও এখানে কাজ করবে
+        fake_api.last_update = [
+            {"update_id": 1, "message": {"chat": {"id": 1000001}, "from": {"id": 1000001, "username": "me"}, "text": "/start"}}
+        ]
+        status, data = await post(client, "/api/setup/detect-owner", {}, headers=headers)
+        assert status == 200 and data["found"] is True and data["owner_id"] == 1000001
+
+        status, data = await post(client, "/api/setup/menu-button", {}, headers=headers)
+        assert status == 200 and data["menu_button"] is True
+    finally:
+        await client.close()
+
+
+def test_detected_url_falls_back_to_browser_origin():
+    """প্রক্সি আসল হোস্ট না দিলে ব্রাউজারের Origin থেকে পাবলিক লিংক বের করা হয়।"""
+
+    class FakeRequest:
+        def __init__(self, headers):
+            self.headers = headers
+            self.scheme = "http"
+
+    headers = {
+        "Host": "127.0.0.1:11002",
+        "Origin": "https://codenestauth.onrender.com",
+        "X-Forwarded-Prefix": "/live/u3-verify-ec07a8",
+    }
+    assert (
+        botmod.request_origin(FakeRequest(headers))
+        == "https://codenestauth.onrender.com/live/u3-verify-ec07a8"
+    )
+    # প্রক্সি হেডার থাকলে সেটাই আগে (আগের আচরণ অপরিবর্তিত)
+    assert (
+        botmod.request_origin(
+            FakeRequest({"Host": "127.0.0.1:11002", "X-Forwarded-Host": "public.example", "X-Forwarded-Proto": "https"})
+        )
+        == "https://public.example"
+    )
+    # কিছুই না থাকলে খালি (ভুল লিংক সেভ হবে না)
+    assert botmod.request_origin(FakeRequest({"Host": "127.0.0.1:11002"})) == ""
+
+
+@pytest.mark.parametrize(
+    "host,private",
+    [
+        ("127.0.0.1:11002", True),
+        ("localhost", True),
+        ("[::1]:8000", True),
+        ("10.0.0.5", True),
+        ("192.168.1.9", True),
+        ("172.17.0.2", True),
+        ("codenestauth.onrender.com", False),
+        ("myapp.example.com", False),
+    ],
+)
+def test_is_private_host(host, private):
+    assert botmod.is_private_host(host) is private
 
 
 async def test_setup_save_is_rate_limited(fake_api, tmp_path):
@@ -211,7 +288,7 @@ async def test_setup_save_is_rate_limited(fake_api, tmp_path):
     await client.start_server()
     try:
         codes = []
-        for _ in range(12):
+        for _ in range(35):
             status, _ = await post(client, "/api/setup/save", form())
             codes.append(status)
         assert 429 in codes, f"অনেকবার চাপলে থামা উচিত: {codes}"
@@ -606,14 +683,14 @@ async def test_setup_save_keeps_prefixed_public_url(fake_api, tmp_path):
         )
         assert status == 200, data
 
-        # অন্য সাইট থেকে হলে আটকাবে
+        # অন্য Origin হলেও এখন আর আটকায় না (শুধু লগ হয়)
         status, data = await post(
             client,
             "/api/setup/save",
             form(),
             headers={**headers, "Origin": "https://evil.example.com"},
         )
-        assert status == 403
+        assert status == 200 and data["status"] == "saved"
     finally:
         await client.close()
 
