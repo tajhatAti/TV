@@ -384,9 +384,11 @@ async def test_full_otp_flow_creates_session_and_dms_only_owner(web, fake_api, s
     assert data["session"] in messages[0]["text"]
 
     client = telethon.last
-    assert client.disconnected is True
     assert client.logged_out is False
     assert store.get_pending(str(USER_A["id"])) is None
+    # revoke window-এর জন্য client মেমরিতে ধরে রাখা হয় (string অটুট রেখে ফোন লগ আউট করার সুযোগ)
+    assert store.completed[str(USER_A["id"])].client is client
+    assert data["auto_revoked"] is False
 
 
 async def test_wrong_otp_returns_400_and_keeps_pending(web, store, telethon):

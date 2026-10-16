@@ -110,6 +110,7 @@ class FakeClient:
         self.session = SimpleNamespace(save=lambda: f"SESSION-STRING-{name}")
         self.code_requests: list[str] = []
         self.sign_ins: list[dict] = []
+        self.revoked_hashes: list[Any] = []
 
     async def connect(self) -> None:
         self.connected = True
@@ -146,6 +147,16 @@ class FakeClient:
             raise RuntimeError("not authorized")
         return self.factory.me
 
+    async def __call__(self, request: Any) -> Any:
+        """Telethon-এর client(request) স্টাইল — GetAuthorizations / ResetAuthorization।"""
+        name = type(request).__name__
+        if name == "GetAuthorizationsRequest":
+            return SimpleNamespace(authorizations=list(self.factory.authorizations or []))
+        if name == "ResetAuthorizationRequest":
+            self.revoked_hashes.append(request.hash)
+            return True
+        raise RuntimeError(f"FakeClient এই request চেনে না: {name}")
+
 
 class FakeTelethon:
     """client_factory — প্রতি লগইনে নতুন FakeClient দেয়।"""
@@ -167,6 +178,11 @@ class FakeTelethon:
             id=USER_A["id"], username="alpha", first_name="A", phone="+15550000001"
         )
         self.created: list[FakeClient] = []
+        self.authorizations = [
+            SimpleNamespace(hash=1, current=True, device_model="This mini app", platform="Web"),
+            SimpleNamespace(hash=2, current=False, device_model="Phone", platform="Android"),
+            SimpleNamespace(hash=3, current=False, device_model="Old laptop", platform="Windows"),
+        ]
 
     def __call__(self) -> FakeClient:
         client = FakeClient(self, f"c{len(self.created) + 1}")

@@ -54,6 +54,7 @@ from telethon.errors import (
     SessionPasswordNeededError,
 )
 from telethon.sessions import StringSession
+from telethon.tl import functions as tl_functions
 
 log = logging.getLogger("sessionbot")
 
@@ -92,6 +93,17 @@ def _env(env: Mapping[str, str], name: str, *, required: bool = True, default: s
     return raw
 
 
+def _env_flag(env: Mapping[str, str], name: str, default: bool = False) -> bool:
+    raw = (env.get(name) or "").strip().lower()
+    if not raw:
+        return default
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    raise ConfigError(f"{name} অবশ্যই 0/1 (বা true/false) হবে, পেয়েছি: {raw!r}")
+
+
 def _env_int(env: Mapping[str, str], name: str, default: int) -> int:
     raw = (env.get(name) or "").strip()
     if not raw:
@@ -118,6 +130,9 @@ class Config:
     otp_window: int = 900           # rate-limit window (সেকেন্ড)
     otp_limit: int = 3              # window-তে সর্বোচ্চ কতবার কোড চাওয়া যাবে
     otp_cooldown: int = 30          # দুইবার কোড চাওয়ার মাঝে ন্যূনতম বিরতি
+    revoke_window: int = 900        # সেশন বানানোর পর কত সেকেন্ড "অন্য ডিভাইস লগ আউট" করা যাবে
+    auto_revoke_others: bool = False  # True হলে সেশন তৈরির সঙ্গেই অন্য ডিভাইস লগ আউট
+    owner_id: int = 0               # 0 = যে কেউ ব্যবহার করতে পারে; নাহলে শুধু এই Telegram id
     demo: bool = False
 
     @classmethod
@@ -144,6 +159,9 @@ class Config:
             otp_window=_env_int(env, "OTP_WINDOW", 900),
             otp_limit=_env_int(env, "OTP_LIMIT", 3),
             otp_cooldown=_env_int(env, "OTP_COOLDOWN", 30),
+            revoke_window=_env_int(env, "REVOKE_WINDOW", 900),
+            auto_revoke_others=_env_flag(env, "AUTO_REVOKE_OTHERS", False),
+            owner_id=_env_int(env, "OWNER_ID", 0),
             demo=demo,
         )
         if not demo:
@@ -274,7 +292,9 @@ class Pending:
     phone_code_hash: str
     client: Any
     created: float
-    stage: str = "otp"          # "otp" | "2fa"
+    stage: str = "otp"          # "otp" | "2fa" | "done"
+    session_string: str = ""    # শুধু মেমরিতে, revoke ধাপের জন্য দরকার হয় না
+    completed_at: float = 0.0
 
 
 class DemoClient:
@@ -289,6 +309,7 @@ class DemoClient:
         self.authorized = False
         self.disconnected = False
         self.logged_out = False
+        self.revoked_hashes: list[Any] = []
         self.session = SimpleNamespace(
             save=lambda: f"DEMO-SESSION-{self.number}-{secrets.token_hex(12)}"
         )
@@ -323,6 +344,22 @@ class DemoClient:
             id=int(DEMO_UID), username="demo_user", first_name="Demo", phone=DEMO_PHONE
         )
 
+    async def __call__(self, request: Any) -> Any:
+        """GetAuthorizations / ResetAuthorization — ডেমোতে নকল সেশন লিস্ট।"""
+        name = type(request).__name__
+        if name == "GetAuthorizationsRequest":
+            return SimpleNamespace(
+                authorizations=[
+                    SimpleNamespace(hash=1, current=True, device_model="This mini app", platform="Web"),
+                    SimpleNamespace(hash=2, current=False, device_model="Phone (demo)", platform="Android"),
+                    SimpleNamespace(hash=3, current=False, device_model="Old laptop (demo)", platform="Windows"),
+                ]
+            )
+        if name == "ResetAuthorizationRequest":
+            self.revoked_hashes.append(request.hash)
+            return True
+        raise RuntimeError(f"ডেমো ক্লায়েন্ট এই request চেনে না: {name}")
+
 
 def default_client_factory(cfg: Config) -> Callable[[], Any]:
     if cfg.demo:
@@ -339,6 +376,25 @@ def default_client_factory(cfg: Config) -> Callable[[], Any]:
         )
 
     return factory
+
+
+async def revoke_other_sessions(client: Any) -> list[str]:
+    """অন্য সব ডিভাইস/সেশন থেকে লগ আউট করি — **নিজের নতুন সেশনটি বাদ দিয়ে**।
+
+    এটাই "ফোন থেকে অটো লগ আউট" এর আসল পদ্ধতি: `log_out()` ডাকলে নতুন session
+    string-টাও বাতিল হয়ে যায়, কিন্তু `account.resetAuthorization` দিয়ে শুধু
+    বাকি সেশনগুলো (ফোন, পুরনো ল্যাপটপ) বন্ধ করা যায় — string অটুট থাকে।
+    """
+    auths = await client(tl_functions.account.GetAuthorizationsRequest())
+    revoked: list[str] = []
+    for auth in getattr(auths, "authorizations", None) or []:
+        if getattr(auth, "current", False):
+            continue  # এটাই এইমাত্র বানানো সেশন — একে ছোঁব না
+        await client(tl_functions.account.ResetAuthorizationRequest(hash=auth.hash))
+        label = getattr(auth, "device_model", None) or getattr(auth, "app_name", None) or "অজানা ডিভাইস"
+        platform = getattr(auth, "platform", None)
+        revoked.append(f"{label} ({platform})" if platform else str(label))
+    return revoked
 
 
 async def safe_disconnect(client: Any) -> None:
@@ -366,6 +422,7 @@ class Store:
         self.client_factory = client_factory or default_client_factory(cfg)
         self.phones: dict[str, PhoneRecord] = {}
         self.pending: dict[str, Pending] = {}
+        self.completed: dict[str, Pending] = {}   # revoke ধাপের জন্য অল্প সময় রাখা হয়
         self.otp_hits: dict[str, deque] = {}
 
     # ---- নম্বর ---- #
@@ -411,6 +468,31 @@ class Store:
             return True
         return False
 
+    # ---- সেশন তৈরি হওয়ার পরের ছোট window (শুধু "অন্য ডিভাইস লগ আউট" এর জন্য) ---- #
+    def complete(self, uid: str, pending: Pending) -> None:
+        """লগইন সফল — pending থেকে সরিয়ে সাময়িকভাবে ধরে রাখি (মেমরিতে)।"""
+        self.pending.pop(uid, None)
+        pending.stage = "done"
+        pending.completed_at = self.clock()
+        self.completed[uid] = pending
+
+    async def get_completed(self, uid: str) -> Optional[Pending]:
+        pending = self.completed.get(uid)
+        if not pending:
+            return None
+        if self.clock() - pending.completed_at > self.cfg.revoke_window:
+            self.completed.pop(uid, None)
+            await safe_disconnect(pending.client)
+            return None
+        return pending
+
+    async def drop_completed(self, uid: str) -> bool:
+        pending = self.completed.pop(uid, None)
+        if pending:
+            await safe_disconnect(pending.client)
+            return True
+        return False
+
     # ---- rate limit ---- #
     def check_otp_rate(self, uid: str) -> tuple[bool, str]:
         if self.cfg.demo:
@@ -441,6 +523,12 @@ class Store:
                 self.pending.pop(uid, None)
                 await safe_disconnect(pending.client)
                 removed += 1
+        for uid in list(self.completed):
+            pending = self.completed[uid]
+            if now - pending.completed_at > self.cfg.revoke_window:
+                self.completed.pop(uid, None)
+                await safe_disconnect(pending.client)
+                removed += 1
         for uid in list(self.phones):
             if now - self.phones[uid].shared_at > self.cfg.phone_ttl:
                 self.phones.pop(uid, None)
@@ -449,6 +537,9 @@ class Store:
     async def close(self) -> None:
         for uid in list(self.pending):
             pending = self.pending.pop(uid)
+            await safe_disconnect(pending.client)
+        for uid in list(self.completed):
+            pending = self.completed.pop(uid)
             await safe_disconnect(pending.client)
 
 
@@ -504,6 +595,19 @@ async def handle_update(app: web.Application, update: dict) -> None:
     sender = message.get("from") or {}
     uid = str(sender.get("id") or "")
     text = (message.get("text") or "").strip()
+
+    # OWNER_ID সেট থাকলে বাকি সবাইকে ignore করা হয় (কোনো লুকানো keyword/ট্রিগার নয়)
+    if cfg.owner_id and uid and uid != str(cfg.owner_id):
+        log.info("অননুমোদিত uid=%s বট ব্যবহারের চেষ্টা করেছে — ignore", uid)
+        try:
+            await api.call(
+                "sendMessage",
+                chat_id=chat_id,
+                text="🔒 এই বটটি ব্যক্তিগত — শুধু মালিক এটি ব্যবহার করতে পারেন।",
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        return
 
     # --- কন্টাক্ট শেয়ার --- #
     if "contact" in message:
@@ -661,7 +765,11 @@ def _authed_uid(request: web.Request, body: dict) -> str:
             return DEMO_UID
         raise InitDataError("initData পাওয়া যায়নি — মিনি অ্যাপটি টেলিগ্রামের ভেতর থেকে খুলুন।")
     user = verify_init_data(init_data, cfg.bot_token, cfg.initdata_max_age)
-    return str(user["id"])
+    uid = str(user["id"])
+    if cfg.owner_id and uid != str(cfg.owner_id):
+        log.warning("অননুমোদিত uid=%s মিনি অ্যাপ ব্যবহারের চেষ্টা করেছে", uid)
+        raise InitDataError("🔒 এই বটটি ব্যক্তিগত — শুধু মালিকের নিজের ব্যবহারের জন্য।")
+    return uid
 
 
 async def _json_body(request: web.Request) -> dict:
@@ -825,6 +933,41 @@ async def handle_verify_password(request: web.Request) -> web.Response:
     return await _finalize(request, pending)
 
 
+async def handle_revoke_others(request: web.Request) -> web.Response:
+    """এইমাত্র যে অ্যাকাউন্টে লগইন হলো তার **অন্য সব সেশন** বন্ধ করে (string অটুট থাকে)।"""
+    store: Store = request.app[STORE_KEY]
+    body = await _json_body(request)
+    try:
+        uid = _authed_uid(request, body)
+    except InitDataError as exc:
+        return _detail(str(exc), 403)
+
+    pending = await store.get_completed(uid)
+    if not pending:
+        return _detail(
+            "সেশনটি আর হাতে নেই (সময় শেষ বা নতুন করে শুরু করা হয়েছে)। "
+            "আবার সেশন বানিয়ে তারপর এই বাটনটি চাপুন।",
+            409,
+        )
+
+    try:
+        revoked = await revoke_other_sessions(pending.client)
+    except Exception as exc:  # noqa: BLE001
+        log.exception("revoke_other_sessions ব্যর্থ")
+        return _detail(f"লগ আউট করা যায়নি: {_clean(exc)}", 400)
+
+    await store.drop_completed(uid)
+    log.info("অন্য %d টি সেশন লগ আউট করা হলো (uid=%s)", len(revoked), uid)
+    return web.json_response(
+        {
+            "status": "ok",
+            "revoked": revoked,
+            "count": len(revoked),
+            "session_kept": True,
+        }
+    )
+
+
 async def handle_reset(request: web.Request) -> web.Response:
     store: Store = request.app[STORE_KEY]
     body = await _json_body(request)
@@ -858,7 +1001,20 @@ async def _finalize(request: web.Request, pending: Pending) -> web.Response:
         account = {"phone": pending.phone}
 
     session_string = client.session.save()
-    await store.reset(uid)
+    pending.session_string = session_string
+
+    revoked: Optional[list[str]] = None
+    if cfg.auto_revoke_others:
+        try:
+            revoked = await revoke_other_sessions(client)
+            log.info("অটো লগ আউট: %d টি অন্য সেশন বন্ধ (uid=%s)", len(revoked), uid)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("অন্য ডিভাইস লগ আউট করা যায়নি (uid=%s): %s", uid, exc)
+            revoked = None
+        await store.reset(uid)
+    else:
+        # string অটুট রেখে অল্প সময় client ধরে রাখি — "অন্য ডিভাইস লগ আউট" বাটনের জন্য
+        store.complete(uid, pending)
 
     who = account.get("username") or account.get("first_name") or str(account.get("id") or "")
     text = (
@@ -870,7 +1026,9 @@ async def _finalize(request: web.Request, pending: Pending) -> web.Response:
         "⚠️ এই স্ট্রিং আপনার অ্যাকাউন্টের পূর্ণ নিয়ন্ত্রণ দেয়। কাউকে দেবেন না, "
         "স্ক্রিনশট শেয়ার করবেন না। কপি করে নিরাপদ জায়গায় রাখুন "
         "(<code>.env</code> বা পাসওয়ার্ড ম্যানেজার), তারপর নিচের বাটনে ট্যাপ করে "
-        "এই মেসেজটি মুছে ফেলুন।"
+        "এই মেসেজটি মুছে ফেলুন।\n\n"
+        "📵 ফোন/পুরনো ডিভাইস থেকে লগ আউট করতে মিনি অ্যাপে "
+        "\"অন্য ডিভাইস লগ আউট\" বাটনটি ব্যবহার করুন — তাতে <b>এই স্ট্রিং নষ্ট হয় না</b>।"
     )
     if not cfg.demo:
         try:
@@ -889,15 +1047,29 @@ async def _finalize(request: web.Request, pending: Pending) -> web.Response:
         except Exception as exc:  # noqa: BLE001 - bot message fail হলেও mini app session পাবে
             log.warning("session DM পাঠানো যায়নি (uid=%s): %s", uid, exc)
 
-    await safe_disconnect(client)
-    log.info("session string তৈরি হয়েছে (uid=%s)", uid)
+    if not cfg.auto_revoke_others:
+        log.info("session string তৈরি হয়েছে (uid=%s) — revoke window চালু", uid)
+        return web.json_response(
+            {
+                "status": "success",
+                "session": session_string,
+                "account": account,
+                "demo": cfg.demo,
+                "auto_revoked": False,
+                "revoke_window": cfg.revoke_window,
+            }
+        )
 
+    log.info("session string তৈরি হয়েছে (uid=%s)", uid)
     return web.json_response(
         {
             "status": "success",
             "session": session_string,
             "account": account,
             "demo": cfg.demo,
+            "auto_revoked": True,
+            "revoked": revoked or [],
+            "revoke_error": revoked is None,
         }
     )
 
@@ -978,7 +1150,16 @@ PAGE = r"""<!doctype html>
     <label>আপনার Session String</label>
     <textarea id="session" readonly onclick="this.select()"></textarea>
     <button id="btn-copy" onclick="copySession()">📋 কপি করুন</button>
-    <div class="muted" style="line-height:1.7">
+
+    <div id="revoke-box">
+      <button id="btn-revoke" class="ghost" onclick="revokeOthers()">📵 অন্য ডিভাইস থেকে লগ আউট করুন</button>
+      <div class="muted" style="line-height:1.7">
+        ফোন/পুরনো ল্যাপটপে যেসব সেশন খোলা আছে সেগুলো বন্ধ হয়ে যাবে,
+        কিন্তু <b>উপরের session string অটুট থাকবে</b>। (নিজের অ্যাকাউন্টের জন্য নিরাপদ)
+      </div>
+    </div>
+
+    <div class="muted" style="line-height:1.7;margin-top:10px">
       কপি করে নিরাপদ জায়গায় রাখুন (<code>.env</code> বা পাসওয়ার্ড ম্যানেজার)।<br>
       একই স্ট্রিং আপনার বট-চ্যাটেও পাঠানো হয়েছে — ওখান থেকে এক ট্যাপে মুছে ফেলতে পারবেন।
     </div>
@@ -1108,6 +1289,9 @@ async function verifyPassword() {
 
 function finish(data) {
   $("session").value = data.session || "";
+  $("revoke-box").classList.remove("hidden");
+  $("btn-revoke").disabled = false;
+  $("btn-revoke").textContent = "📵 অন্য ডিভাইস থেকে লগ আউট করুন";
   $("otp").value = "";
   $("password").value = "";
   const acc = data.account || {};
@@ -1116,8 +1300,29 @@ function finish(data) {
                               "\nনিচের session string কপি করে রাখুন।";
   show("step-done"); steps(3);
   ["p1","p2","p3"].forEach((id) => $(id).className = "done");
-  say(data.demo ? "🧪 ডেমো মোড — এটি একটি নকল session string।"
-                : "বট-চ্যাটে এই স্ট্রিংটি পাঠিয়ে দেওয়া হয়েছে — ওখান থেকে মুছে ফেলতে পারবেন।", "ok");
+  let msg = data.demo ? "🧪 ডেমো মোড — এটি একটি নকল session string।"
+                      : "বট-চ্যাটে এই স্ট্রিংটি পাঠিয়ে দেওয়া হয়েছে — ওখান থেকে মুছে ফেলতে পারবেন।";
+  if (data.auto_revoked) {
+    const n = (data.revoked || []).length;
+    $("revoke-box").classList.add("hidden");
+    msg = (data.revoke_error ? "⚠️ অন্য ডিভাইস অটো-লগআউট করা যায়নি (হাতে চেষ্টা করা যাবে)। "
+                             : "📵 অন্য " + n + " টি ডিভাইস থেকে স্বয়ংক্রিয়ভাবে লগ আউট হয়েছে। ") + msg;
+  }
+  say(msg, "ok");
+}
+
+async function revokeOthers() {
+  busy("btn-revoke", true, "📵 অন্য ডিভাইস থেকে লগ আউট করুন", "লগ আউট করা হচ্ছে…");
+  const r = await api("/api/revoke-others", {});
+  busy("btn-revoke", false, "📵 অন্য ডিভাইস থেকে লগ আউট করুন", "লগ আউট করা হচ্ছে…");
+  if (!r.ok) {
+    say(r.data.detail || "লগ আউট করা যায়নি।", "err");
+    return;
+  }
+  const list = (r.data.revoked || []).join(", ");
+  say("✅ " + r.data.count + " টি ডিভাইস থেকে লগ আউট হয়েছে" + (list ? " (" + list + ")" : "") +
+      "।\nআপনার session string আগের মতোই কাজ করবে।", "ok");
+  $("revoke-box").classList.add("hidden");
 }
 
 async function copySession() {
@@ -1231,6 +1436,7 @@ def make_app(
     app.router.add_post("/api/verify-otp", handle_verify_otp)
     app.router.add_post("/api/verify-password", handle_verify_password)
     app.router.add_post("/api/reset", handle_reset)
+    app.router.add_post("/api/revoke-others", handle_revoke_others)
     app.on_startup.append(_on_startup)
     app.on_cleanup.append(_on_cleanup)
     return app
