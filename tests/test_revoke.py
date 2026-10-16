@@ -6,7 +6,7 @@ import pytest
 from aiohttp.test_utils import TestClient, TestServer
 
 import bot as botmod
-from conftest import BOT_TOKEN, USER_A, USER_B, FakeClient, build_init_data, post
+from conftest import USER_A, USER_B, FakeClient, build_init_data, post
 
 ROOT = __import__("pathlib").Path(__file__).resolve().parents[1]
 
@@ -120,9 +120,8 @@ async def test_sweep_closes_stale_completed_clients(cfg, telethon):
     assert client.disconnected is True
 
 
-async def test_new_phone_share_cancels_previous_pending(cfg, telethon, fake_api, store):
+async def test_new_phone_share_cancels_previous_pending(cfg, telethon, store):
     """নতুন নম্বর শেয়ার করলে আগের অসম্পূর্ণ client বন্ধ হয়।"""
-    app = botmod.make_app(cfg, api=fake_api, store=store)
     first = telethon()
     store.put_pending(str(USER_A["id"]), "+15550000001", "H", first)
     await store.set_phone(str(USER_A["id"]), "+15550000002")
