@@ -989,18 +989,32 @@ SETUP_PAGE = r"""<!doctype html>
   <div id="msg"></div>
 </div>
 <script>
+// হোস্টিং প্ল্যাটফর্ম যদি অ্যাপকে পাথ প্রিফিক্সের নিচে চালায়
+// (যেমন https://host/live/xxxx/), তাহলে সব API কল সেই একই পাথ দিয়েই যাবে।
+// এতে কোনো সেটিং ছাড়াই সব হোস্টিংয়ে কাজ করে।
+const BASE = (() => {
+  let p = window.location.pathname || "/";
+  if (!p.endsWith("/")) {
+    const last = p.split("/").pop() || "";
+    p = last.includes(".") ? p.slice(0, p.length - last.length) : p + "/";
+  }
+  return p;
+})();
+function apiUrl(path) { return BASE + String(path).replace(/^\/+/, ""); }
+function publicUrl() { return window.location.origin + BASE; }
+
 const $ = (id) => document.getElementById(id);
 function say(text, cls) { const el = $("msg"); el.className = cls || ""; el.textContent = text || ""; }
 function busy(id, on, busyText) { const b = $(id); b.disabled = on; if (busyText) b.textContent = busyText; }
 async function api(path, body) {
-  const res = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body || {}) });
+  const res = await fetch(apiUrl(path), { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body || {}) });
   let data = {}; try { data = await res.json(); } catch (e) {}
   return { ok: res.ok, data: data };
 }
 
 async function loadStatus() {
   try {
-    const res = await fetch("/api/setup/status");
+    const res = await fetch(apiUrl("/api/setup/status"));
     const st = await res.json();
     const lines = [];
     if (st.demo) {
@@ -1015,10 +1029,12 @@ async function loadStatus() {
     } else {
       lines.push("⚙️ এখনো কনফিগার করা হয়নি — নিচের ফর্মটি পূরণ করে সেভ করুন।");
     }
-    lines.push("🌐 মিনি অ্যাপ লিংক: <code>" + (st.webapp_url || st.detected_url || "—") + "</code>");
+    lines.push("🌐 মিনি অ্যাপ লিংক: <code>" + (st.webapp_url || publicUrl()) + "</code>");
     lines.push("ℹ️ খালি ঘর বাদ দিলে আগের মানই থাকবে — টোকেন নতুন করে দিলে সব আগের তথ্য থেকে যাবে।");
     $("status").innerHTML = lines.join("<br>");
-    if (!st.webapp_url && st.detected_url) $("webapp_url").value = st.detected_url + "/";
+    const guess = publicUrl();
+    if (!st.webapp_url) $("webapp_url").value = guess;
+    $("webapp_url").placeholder = guess;
     if (st.owner_id) $("owner_id").value = st.owner_id;
     $("auto_revoke").checked = !!st.auto_revoke_others;
     $("btn-menu").style.display = st.configured ? "block" : "none";
@@ -1078,7 +1094,7 @@ loadStatus();
 # সেটআপ পেজ — env variable ছাড়াই সব কিছু ওয়েব থেকে
 # --------------------------------------------------------------------------- #
 def request_origin(request: web.Request) -> str:
-    """পাবলিক লিংক অনুমান করি (Render/CodeNest-এর reverse proxy হেডার থেকে)।"""
+    """পাবলিক লিংক অনুমান করি (reverse proxy হেডার থেকে, পাথ প্রিফিক্স সহ)।"""
     proto = (request.headers.get("X-Forwarded-Proto") or "").split(",")[0].strip()
     host = (request.headers.get("X-Forwarded-Host") or "").split(",")[0].strip()
     if not host:
@@ -1087,7 +1103,10 @@ def request_origin(request: web.Request) -> str:
         return ""
     if proto not in {"http", "https"}:
         proto = "https" if request.scheme in {"https", ""} else request.scheme
-    return f"{proto}://{host}"
+    prefix = (request.headers.get("X-Forwarded-Prefix") or "").split(",")[0].strip()
+    if prefix:
+        prefix = "/" + prefix.strip("/") if prefix.strip("/") else ""
+    return f"{proto}://{host}{prefix}"
 
 
 def setup_state(app: web.Application) -> dict:
@@ -1259,6 +1278,42 @@ async def handle_setup_detect_owner(request: web.Request) -> web.Response:
             "first_name": sender.get("first_name"),
         }
     )
+
+
+def rewrite_prefixed_path(path: str) -> Optional[str]:
+    """প্রিফিক্সসহ পাথকে আসল রুটে নামাই (proxy না কাটলে কাজে লাগে)।
+
+    /live/u3-verify-ec07a8/api/setup/save → /api/setup/save
+    /live/u3-verify-ec07a8/               → /
+    অজানা পাথ হলে None (৪০৪)।
+    """
+    known = ("/api/", "/health", "/setup")
+    if path == "/" or path.startswith(known) or path.startswith("/api"):
+        return path
+    hits = [idx for marker in known if (idx := path.find(marker)) > 0]
+    if hits:
+        return path[min(hits):]
+    if path.endswith("/"):
+        return "/"
+    return None
+
+
+def make_fallback(table: dict) -> Any:
+    """নিবন্ধিত রুটের বাইরে পড়া পাথগুলো আসল হ্যান্ডলারে পাঠায় (প্রিফিক্স টালারেন্স)।"""
+
+    async def handle_fallback(request: web.Request) -> web.Response:
+        target = rewrite_prefixed_path(request.rel_url.path)
+        if target is None:
+            return web.Response(status=404, text="Not Found")
+        handler = table.get((request.method, target))
+        if handler is not None:
+            return await handler(request)
+        if any(path == target for _, path in table):
+            allowed = sorted(m for m, path in table if path == target)
+            return web.Response(status=405, text="Method Not Allowed", headers={"Allow": ", ".join(allowed)})
+        return web.Response(status=404, text="Not Found")
+
+    return handle_fallback
 
 
 def need_setup(request: web.Request) -> Optional[web.Response]:
@@ -1676,6 +1731,20 @@ PAGE = r"""<!doctype html>
 const tg = window.Telegram && window.Telegram.WebApp ? window.Telegram.WebApp : null;
 if (tg) { try { tg.ready(); tg.expand(); } catch (e) {} }
 
+// হোস্টিং প্ল্যাটফর্ম যদি অ্যাপকে পাথ প্রিফিক্সের নিচে চালায়
+// (যেমন https://host/live/xxxx/), তাহলে সব API কল সেই একই পাথ দিয়েই যাবে।
+// এতে কোনো সেটিং ছাড়াই সব হোস্টিংয়ে কাজ করে।
+const BASE = (() => {
+  let p = window.location.pathname || "/";
+  if (!p.endsWith("/")) {
+    const last = p.split("/").pop() || "";
+    p = last.includes(".") ? p.slice(0, p.length - last.length) : p + "/";
+  }
+  return p;
+})();
+function apiUrl(path) { return BASE + String(path).replace(/^\/+/, ""); }
+function publicUrl() { return window.location.origin + BASE; }
+
 const $ = (id) => document.getElementById(id);
 const appMeta = { demo: false };
 
@@ -1701,7 +1770,7 @@ function busy(btn, on, idleText, busyText) {
 }
 async function api(path, body) {
   const payload = Object.assign({ initData: tg ? tg.initData : "" }, body || {});
-  const res = await fetch(path, {
+  const res = await fetch(apiUrl(path), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload)
@@ -1724,7 +1793,7 @@ function demoBanner(meta) {
 async function bootstrap() {
   let meta = { demo: false };
   try {
-    const res = await fetch("/api/config");
+    const res = await fetch(apiUrl("/api/config"));
     if (res.ok) meta = await res.json();
   } catch (e) {}
   Object.assign(appMeta, meta);
@@ -1901,14 +1970,20 @@ def same_origin_ok(request: web.Request) -> bool:
     কোনো অতিরিক্ত পাসওয়ার্ড/PIN লাগে না — শুধু অন্য সাইট থেকে চুপিচুপি
     সেভ করা যাবে না। (curl/স্ক্রিপ্টে Origin থাকে না, তাই ওগুলো চলবে।)
     """
-    host = (request.headers.get("X-Forwarded-Host") or request.headers.get("Host") or "")
-    host = host.split(",")[0].strip().lower()
+    hosts = set()
+    for header in ("X-Forwarded-Host", "Host"):
+        value = (request.headers.get(header) or "").split(",")[0].strip().lower()
+        if value:
+            hosts.add(value)
+    if not hosts:
+        return True
     for header in ("Origin", "Referer"):
         value = (request.headers.get(header) or "").strip()
         if not value:
             continue
-        parsed = urlsplit(value)
-        if (parsed.netloc or "").lower() != host:
+        netloc = (urlsplit(value).netloc or "").lower()
+        if netloc not in hosts:
+            log.warning("CSRF: %s=%s হোস্টের সাথে মেলেনি (%s)", header, netloc, sorted(hosts))
             return False
     return True
 
@@ -2095,19 +2170,25 @@ def make_app(
     if http is not None:
         app[HTTP_KEY] = http
 
-    app.router.add_get("/", handle_page)
-    app.router.add_get("/health", handle_health)
-    app.router.add_get("/api/config", handle_config)
-    app.router.add_get("/setup", handle_setup_page)
-    app.router.add_get("/api/setup/status", handle_setup_status)
-    app.router.add_post("/api/setup/save", handle_setup_save)
-    app.router.add_post("/api/setup/menu-button", handle_setup_menu_button)
-    app.router.add_post("/api/setup/detect-owner", handle_setup_detect_owner)
-    app.router.add_post("/api/request-otp", handle_request_otp)
-    app.router.add_post("/api/verify-otp", handle_verify_otp)
-    app.router.add_post("/api/verify-password", handle_verify_password)
-    app.router.add_post("/api/reset", handle_reset)
-    app.router.add_post("/api/revoke-others", handle_revoke_others)
+    routes = [
+        ("GET", "/", handle_page),
+        ("GET", "/health", handle_health),
+        ("GET", "/api/config", handle_config),
+        ("GET", "/setup", handle_setup_page),
+        ("GET", "/api/setup/status", handle_setup_status),
+        ("POST", "/api/setup/save", handle_setup_save),
+        ("POST", "/api/setup/menu-button", handle_setup_menu_button),
+        ("POST", "/api/setup/detect-owner", handle_setup_detect_owner),
+        ("POST", "/api/request-otp", handle_request_otp),
+        ("POST", "/api/verify-otp", handle_verify_otp),
+        ("POST", "/api/verify-password", handle_verify_password),
+        ("POST", "/api/reset", handle_reset),
+        ("POST", "/api/revoke-others", handle_revoke_others),
+    ]
+    for method, path, handler in routes:
+        app.router.add_route(method, path, handler)
+    # হোস্টিং যদি পাথ প্রিফিক্স কেটে না দেয়, তাহলে এই catch-all সেটা সামলে নেবে
+    app.router.add_route("*", "/{tail:.*}", make_fallback({(m, p): h for m, p, h in routes}))
     app.on_startup.append(_on_startup)
     app.on_cleanup.append(_on_cleanup)
     return app

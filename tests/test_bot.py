@@ -644,7 +644,7 @@ def test_mini_app_has_no_innerhtml_sinks_with_server_data():
 
 def test_mini_app_bootstrap_uses_config_endpoint():
     script = _page_script()
-    assert 'fetch("/api/config")' in script
+    assert 'apiUrl("/api/config")' in script
     assert "meta.demo" in script
     # ডেমো না হলে initData ছাড়া এগোনো যাবে না
     assert 'if (tg && tg.initData) { requestOtp(); return; }' in script

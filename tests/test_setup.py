@@ -494,6 +494,181 @@ def test_setup_page_has_all_fields_and_hits_only_existing_routes(tmp_path):
     }, paths
 
 
+def _script(page: str) -> str:
+    import re
+
+    return re.search(r"<script>(.*?)</script>", page, re.S).group(1)
+
+
+def test_setup_page_uses_relative_api_paths():
+    """হোস্টিং অ্যাপকে পাথ প্রিফিক্সের নিচে চালালেও (যেমন /live/xxxx/) কল ঠিক জায়গায় যাবে।"""
+    script = _script(botmod.SETUP_PAGE)
+    assert "const BASE" in script and "apiUrl" in script
+    assert 'fetch("/' not in script, "রুট থেকে fetch করলে প্রিফিক্স হোস্টিংয়ে Not Found আসে"
+    for call in ("apiUrl(path)", 'apiUrl("/api/setup/status")'):
+        assert call in script
+    assert "publicUrl()" in script, "লিংক ঘর নিজে থেকেই ভরে দেওয়া উচিত"
+
+
+def test_mini_app_page_uses_relative_api_paths():
+    script = _script(botmod.PAGE)
+    assert "const BASE" in script and "apiUrl" in script
+    assert 'fetch("/' not in script, "মিনি অ্যাপও প্রিফিক্স-সেফ হতে হবে"
+    assert 'fetch(apiUrl("/api/config"))' in script
+    assert "fetch(apiUrl(path)" in script
+
+
+def test_base_detection_logic_in_node(tmp_path):
+    """BASE হিসাবটা আসল প্রিফিক্স উদাহরণে যাচাই করি (node দিয়ে)।"""
+    import shutil
+    import subprocess
+
+    node = shutil.which("node")
+    if node is None:
+        import pytest as _pytest
+
+        _pytest.skip("node ইনস্টল করা নেই")
+    script = _script(botmod.SETUP_PAGE)
+    base_fn = script[script.index("const BASE"):script.index("function publicUrl")]
+    harness = f'''
+const cases = [
+  ["/", "/"],
+  ["/live/u3-verify-ec07a8/", "/live/u3-verify-ec07a8/"],
+  ["/live/u3-verify-ec07a8", "/live/u3-verify-ec07a8/"],
+  ["/live/abc/index.html", "/live/abc/"],
+];
+const fails = [];
+for (const [pathname, want] of cases) {{
+  const window = {{ location: {{ pathname, origin: "https://host.example" }} }};
+  {base_fn}
+  const got = apiUrl("api/setup/save");
+  const wantUrl = want + "api/setup/save";
+  if (got !== wantUrl) fails.push(pathname + " → " + got + " (চাই " + wantUrl + ")");
+}}
+if (fails.length) {{ console.log(fails.join("\\n")); process.exit(1); }}
+console.log("ok");
+'''
+    path = tmp_path / "base.js"
+    path.write_text(harness, encoding="utf-8")
+    result = subprocess.run([node, str(path)], capture_output=True, text=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+async def test_request_origin_honours_forwarded_prefix(fake_api, tmp_path):
+    app, _ = unconfigured_app(fake_api, tmp_path)
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        resp = await client.get(
+            "/api/setup/status",
+            headers={
+                "X-Forwarded-Proto": "https",
+                "X-Forwarded-Host": "codenestauth.onrender.com",
+                "X-Forwarded-Prefix": "/live/u3-verify-ec07a8",
+            },
+        )
+        detected = (await resp.json())["detected_url"]
+        assert detected == "https://codenestauth.onrender.com/live/u3-verify-ec07a8", detected
+    finally:
+        await client.close()
+
+
+async def test_setup_save_keeps_prefixed_public_url(fake_api, tmp_path):
+    app, _ = unconfigured_app(fake_api, tmp_path)
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        headers = {
+            "X-Forwarded-Proto": "https",
+            "X-Forwarded-Host": "codenestauth.onrender.com",
+            "X-Forwarded-Prefix": "/live/u3-verify-ec07a8",
+        }
+        status, data = await post(
+            client,
+            "/api/setup/save",
+            form(webapp_url="https://codenestauth.onrender.com/live/u3-verify-ec07a8/"),
+            headers=headers,
+        )
+        assert status == 200, data
+        assert (
+            botmod.app_config(app).webapp_url
+            == "https://codenestauth.onrender.com/live/u3-verify-ec07a8"
+        )
+        menu = fake_api.params_of("setChatMenuButton")[-1]["menu_button"]["web_app"]["url"]
+        assert menu.endswith("/live/u3-verify-ec07a8"), menu
+
+        # প্ল্যাটফর্মের Origin হেডার থাকলেও সেভ আটকাবে না
+        status, data = await post(
+            client,
+            "/api/setup/save",
+            form(),
+            headers={**headers, "Origin": "https://codenestauth.onrender.com"},
+        )
+        assert status == 200, data
+
+        # অন্য সাইট থেকে হলে আটকাবে
+        status, data = await post(
+            client,
+            "/api/setup/save",
+            form(),
+            headers={**headers, "Origin": "https://evil.example.com"},
+        )
+        assert status == 403
+    finally:
+        await client.close()
+
+
+@pytest.mark.parametrize(
+    "path,expected",
+    [
+        ("/", "/"),
+        ("/health", "/health"),
+        ("/api/setup/save", "/api/setup/save"),
+        ("/live/u3-verify-ec07a8/", "/"),
+        ("/live/u3-verify-ec07a8", None),
+        ("/live/u3-verify-ec07a8/health", "/health"),
+        ("/live/u3-verify-ec07a8/setup", "/setup"),
+        ("/live/u3-verify-ec07a8/api/setup/save", "/api/setup/save"),
+        ("/live/a/b/c/api/request-otp", "/api/request-otp"),
+        ("/favicon.ico", None),
+        ("/kemono", None),
+    ],
+)
+def test_rewrite_prefixed_path(path, expected):
+    assert botmod.rewrite_prefixed_path(path) == expected
+
+
+async def test_prefix_tolerance_both_proxy_styles(fake_api, tmp_path):
+    """প্ল্যাটফর্ম প্রিফিক্স না কাটলেও (বা কাটলেও) সব রুট ঠিকঠাক কাজ করবে।"""
+    app, _ = unconfigured_app(fake_api, tmp_path)
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        base = "/live/u3-verify-ec07a8"
+        # ১) প্রিফিক্সসহ (proxy না কাটলে)
+        resp = await client.get(base + "/")
+        assert resp.status == 200 and "সেটআপ" in await resp.text()
+        resp = await client.get(base + "/health")
+        assert resp.status == 200 and (await resp.json())["status"] == "ok"
+        resp = await client.get(base + "/api/setup/status")
+        assert resp.status == 200 and (await resp.json())["open_access"] is True
+        resp = await client.get(base + "/setup")
+        assert resp.status == 200 and "সেটআপ" in await resp.text()
+        status, data = await post(client, base + "/api/setup/save", form())
+        assert status == 200 and data["status"] == "saved", data
+
+        # ২) প্রিফিক্স ছাড়া (প্ল্যাটফর্ম নিজেই কেটে দিলে)
+        assert (await client.get("/")).status == 200
+        assert (await client.get("/health")).status == 200
+        assert (await client.get("/api/setup/status")).status == 200
+
+        # ৩) অজানা পাথ আসলেই 404
+        assert (await client.get("/favicon.ico")).status == 404
+        assert (await client.get("/kemono")).status == 404
+    finally:
+        await client.close()
+
+
 def test_setup_page_has_no_pin_field():
     page = botmod.SETUP_PAGE
     assert 'id="pin"' not in page and "SETUP PIN" not in page, "PIN সিস্টেম থাকা যাবে না"
