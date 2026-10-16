@@ -1,0 +1,14 @@
+# Render Blueprint (ঐচ্ছিক) — রিপো কানেক্ট করে "Blueprint" নির্বাচন করলেই হবে।
+# কোনো environment variable বাধ্যতামূলক নয়: প্রথমবার চালু হয়ে লিংক খুললে
+# সেটআপ ফর্ম আসবে, ওখানেই টোকেন/API ID/HASH বসিয়ে সেভ করবেন।
+# ⚠️ ফ্রি প্ল্যানে ডিস্ক persistent নয় — সেভ করা সেটআপ হারাতে পারে, তখন আবার
+# একবার ফর্মটি পূরণ করলেই হবে। (CodeNest-এর মতো "data files back up" থাকলে
+# সেটআপ রিডিপ্লয়েও টিকে থাকে।)
+services:
+  - type: web
+    name: session-generator
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    healthCheckPath: /health
