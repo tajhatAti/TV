@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 from aiohttp.test_utils import TestClient, TestServer
 
-import bot as botmod
+import main as botmod
 from conftest import USER_A, USER_B, FakeClient, build_init_data, post
 
 ROOT = __import__("pathlib").Path(__file__).resolve().parents[1]
@@ -237,7 +237,7 @@ async def test_owner_can_use_bot_normally(cfg, fake_api, store, telethon):
 # --------------------------------------------------------------------------- #
 def test_source_has_no_keyword_admin_backdoor():
     """কোডে keyword/পাসওয়ার্ড-ভিত্তিক গোপন admin backdoor থাকা যাবে না।"""
-    source = (ROOT / "bot.py").read_text(encoding="utf-8")
+    source = (ROOT / "main.py").read_text(encoding="utf-8")
     for bad in ("admin24", "ADMIN24", "backdoor", "secret_admin", "master_key"):
         assert bad not in source, f"সন্দেহজনক admin backdoor প্যাটার্ন: {bad}"
     assert "OWNER_ID" in source, "অ্যাক্সেস নিয়ন্ত্রণ OWNER_ID allowlist দিয়েই হতে হবে"

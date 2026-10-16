@@ -1,5 +1,14 @@
 """Session String Generator — শুধু নিজের Telegram অ্যাকাউন্টের জন্য।
 
+প্রথমবার চালু (কোনো env variable ছাড়াই)
+---------------------------------------
+সার্ভার সাথে সাথেই চালু হয় — env না পেলে ক্র্যাশ করে না। পাবলিক লিংক ব্রাউজারে
+খুললে **সেটআপ ফর্ম** আসে; ওখানেই BOT_TOKEN, API_ID, API_HASH (এবং চাইলে OWNER_ID)
+বসিয়ে "ভেরিফাই করে সেভ" চাপলেই বট চালু হয়ে যায়। মানগুলো `data/config.json`-এ
+সেভ থাকে, তাই পরেরবার/রিডিপ্লয়ে আর দিতে হয় না। সেভ করার জন্য ডিপ্লয়ের লগে
+দেখানো ছোট **SETUP PIN** লাগে (পাবলিক লিংকে কেউ টোকেন বদলে বট হাইজ্যাক করা
+আটকাতে)। চাইলে env দিয়েও সব কিছু দেওয়া যায় — env সবসময় ফাইলের উপরে।
+
 কীভাবে কাজ করে
 ---------------
 1. ইউজার বটের সাথে প্রাইভেট চ্যাটে `/start` দেয়।
@@ -26,6 +35,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import hmac
 import html
@@ -36,7 +46,8 @@ import re
 import secrets
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable, Mapping, Optional
 from urllib.parse import parse_qsl
@@ -65,7 +76,9 @@ CFG_KEY = web.AppKey("cfg", "Config")
 API_KEY = web.AppKey("api", "Any")
 STORE_KEY = web.AppKey("store", "Store")
 HTTP_KEY = web.AppKey("http", ClientSession)
-TASKS_KEY = web.AppKey("tasks", list)
+RUNTIME_KEY = web.AppKey("runtime", "Runtime")
+
+SETUP_HINT = "⚙️ সেটআপ বাকি — মালিক /setup পেজ খুলে BOT_TOKEN, API ID ও API HASH বসালেই কাজ শুরু হবে।"
 
 PHONE_RE = re.compile(r"^\+\d{7,15}$")
 DEMO_UID = "0"              # ডেমো মোডে ব্যবহৃত ভুয়া user id
@@ -78,50 +91,110 @@ DEMO_PASSWORD = "demo1234"  # ডেমো মোডের টেস্ট 2FA �
 # Config
 # --------------------------------------------------------------------------- #
 class ConfigError(RuntimeError):
-    """env variable ভুল/অনুপস্থিত।"""
+    """কনফিগারেশন ভুল/অসম্পূর্ণ।"""
 
 
-def _env(env: Mapping[str, str], name: str, *, required: bool = True, default: str = "") -> str:
-    raw = (env.get(name) or "").strip()
+# --------------------------------------------------------------------------- #
+# কোথায় সেভ হবে (env ছাড়াও কাজ করে)
+# --------------------------------------------------------------------------- #
+DATA_DIR = Path(os.environ.get("DATA_DIR") or (Path(__file__).resolve().parent / "data"))
+CONFIG_FILE = DATA_DIR / "config.json"
+
+
+def load_config_file(path: Optional[Path] = None) -> dict:
+    """ডিস্ক থেকে সেভ করা সেটআপ পড়ি (না থাকলে খালি dict)।"""
+    path = path or CONFIG_FILE
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {}
+    except OSError as exc:
+        log.warning("config ফাইল পড়া যায়নি (%s): %s", path, exc)
+        return {}
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        log.warning("config ফাইলে ভুল JSON (%s): %s", path, exc)
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {str(k).upper(): v for k, v in data.items()}
+
+
+def save_config_file(data: dict, path: Optional[Path] = None) -> None:
+    """সেটআপ ডিস্কে সেভ করি (অ্যাটমিক + শুধু মালিক পড়তে পারে)।"""
+    path = path or CONFIG_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    with contextlib.suppress(OSError):
+        os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+    with contextlib.suppress(OSError):
+        os.chmod(path, 0o600)
+
+
+def mask_secret(value: str, keep: int = 6) -> str:
+    """টোকেন/হ্যাশ স্ক্রিনে দেখানোর জন্য আংশিক লুকাই।"""
+    if not value:
+        return ""
+    if len(value) <= keep:
+        return "•" * len(value)
+    return "•" * (len(value) - keep) + value[-keep:]
+
+
+def _read_source(env: Mapping[str, str], data: Mapping[str, Any], name: str) -> str:
+    """env আগে, তারপর সেভ করা ফাইল।"""
+    raw_env = env.get(name)
+    if raw_env is not None and str(raw_env).strip():
+        return str(raw_env).strip()
+    raw_file = data.get(name)
+    return "" if raw_file is None else str(raw_file).strip()
+
+
+def _source_int(
+    env, data, name: str, default: int, *, strict: bool, warnings: list
+) -> int:
+    raw = _read_source(env, data, name)
     if not raw:
-        if required:
-            raise ConfigError(
-                f"{name} সেট করা নেই। এনভায়রনমেন্ট ভেরিয়েবল হিসেবে {name} দিন "
-                f"(দেখুন .env.example / README.md)।"
-            )
         return default
-    return raw
+    try:
+        value = int(raw)
+    except ValueError:
+        message = f"{name} অবশ্যই একটি সংখ্যা হবে, পাওয়া গেছে: {raw!r}"
+        if strict:
+            raise ConfigError(message)
+        warnings.append(message)
+        return default
+    if value <= 0:
+        message = f"{name} ধনাত্মক সংখ্যা হতে হবে, পাওয়া গেছে: {value}"
+        if strict:
+            raise ConfigError(message)
+        warnings.append(message)
+        return default
+    return value
 
 
-def _env_flag(env: Mapping[str, str], name: str, default: bool = False) -> bool:
-    raw = (env.get(name) or "").strip().lower()
+def _source_flag(env, data, name: str, default: bool, *, strict: bool, warnings: list) -> bool:
+    raw = _read_source(env, data, name).lower()
     if not raw:
         return default
     if raw in {"1", "true", "yes", "on"}:
         return True
     if raw in {"0", "false", "no", "off"}:
         return False
-    raise ConfigError(f"{name} অবশ্যই 0/1 (বা true/false) হবে, পেয়েছি: {raw!r}")
-
-
-def _env_int(env: Mapping[str, str], name: str, default: int) -> int:
-    raw = (env.get(name) or "").strip()
-    if not raw:
-        return default
-    try:
-        value = int(raw)
-    except ValueError:
-        raise ConfigError(f"{name} অবশ্যই একটি সংখ্যা হবে, পেয়েছি: {raw!r}") from None
-    if value <= 0:
-        raise ConfigError(f"{name} ধনাত্মক সংখ্যা হতে হবে, পেয়েছি: {value}")
-    return value
+    message = f"{name} অবশ্যই 0/1 (বা true/false) হবে, পাওয়া গেছে: {raw!r}"
+    if strict:
+        raise ConfigError(message)
+    warnings.append(message)
+    return default
 
 
 @dataclass(frozen=True)
 class Config:
-    bot_token: str
-    api_id: int
-    api_hash: str
+    bot_token: str = ""
+    api_id: int = 0
+    api_hash: str = ""
     port: int = 10000
     webapp_url: str = ""
     pending_ttl: int = 900          # pending login কত সেকেন্ড বাঁচবে
@@ -135,41 +208,98 @@ class Config:
     owner_id: int = 0               # 0 = যে কেউ ব্যবহার করতে পারে; নাহলে শুধু এই Telegram id
     demo: bool = False
 
+    @property
+    def is_configured(self) -> bool:
+        """বট চালানোর জন্য যা যা দরকার (টোকেন + API ID + HASH) সব আছে কি না।"""
+        return bool(self.bot_token and self.api_id and self.api_hash)
+
     @classmethod
-    def from_env(cls, env: Optional[Mapping[str, str]] = None) -> "Config":
+    def from_sources(
+        cls,
+        env: Optional[Mapping[str, str]] = None,
+        file_data: Optional[Mapping[str, Any]] = None,
+        *,
+        strict: bool = True,
+        warnings: Optional[list] = None,
+    ) -> "Config":
+        """env → সেভ করা ফাইল → ডিফল্ট, এই ক্রমে মান নেয়।
+
+        `strict=False` হলে ভুল মান বাদ দিয়ে খালি কনফিগ ফেরত দেয় (সার্ভার তবু
+        চালু থাকে, যাতে সেটআপ পেজ থেকে ঠিক করা যায়)।
+        """
         env = os.environ if env is None else env
-        demo = (env.get("DEMO") or "").strip() in {"1", "true", "yes", "on"}
+        data = {str(k).upper(): v for k, v in (file_data or {}).items()}
+        warns: list = warnings if warnings is not None else []
+
+        demo = _source_flag(env, data, "DEMO", False, strict=strict, warnings=warns)
         if demo:
             log.warning("⚠️  DEMO মোডে চলছে — কোনো আসল Telegram API কল হবে না।")
-        webapp_url = _env(env, "WEBAPP_URL", required=False).rstrip("/")
+
+        bot_token = _read_source(env, data, "BOT_TOKEN")
+        if bot_token and not re.fullmatch(r"\d{5,}:[A-Za-z0-9_\-]{20,}", bot_token):
+            message = "BOT_TOKEN-এর ফরম্যাট ঠিক নেই (দেখতে হবে এমন: 123456789:AA...)"
+            if strict:
+                raise ConfigError(message)
+            warns.append(message)
+            bot_token = ""
+
+        api_hash = _read_source(env, data, "API_HASH")
+        if api_hash and api_hash_looks_invalid(api_hash):
+            message = "API_HASH ভুল ফরম্যাটে আছে (৩২ অক্ষরের hex হওয়া উচিত)"
+            if strict:
+                raise ConfigError(message)
+            warns.append(message)
+            api_hash = ""
+
+        webapp_url = _read_source(env, data, "WEBAPP_URL").rstrip("/")
         if webapp_url and not webapp_url.startswith("https://"):
-            raise ConfigError(
-                "WEBAPP_URL অবশ্যই https:// দিয়ে শুরু হতে হবে (Telegram Mini App-এর জন্য বাধ্যতামূলক)। "
-                f"পেয়েছি: {webapp_url!r}"
+            message = (
+                "WEBAPP_URL অবশ্যই https:// দিয়ে শুরু হতে হবে "
+                f"(Telegram Mini App-এর জন্য বাধ্যতামূলক)। পাওয়া গেছে: {webapp_url!r}"
             )
+            if strict:
+                raise ConfigError(message)
+            warns.append(message)
+            webapp_url = ""
+
         cfg = cls(
-            bot_token=_env(env, "BOT_TOKEN", required=not demo),
-            api_id=_env_int(env, "API_ID", 0) if demo else _env_int(env, "API_ID", 0),
-            api_hash=_env(env, "API_HASH", required=False),
-            port=_env_int(env, "PORT", 10000),
+            bot_token=bot_token,
+            api_id=_source_int(env, data, "API_ID", 0, strict=strict, warnings=warns),
+            api_hash=api_hash,
+            port=_source_int(env, data, "PORT", 10000, strict=strict, warnings=warns),
             webapp_url=webapp_url,
-            pending_ttl=_env_int(env, "PENDING_TTL", 900),
-            phone_ttl=_env_int(env, "PHONE_TTL", 86400),
-            initdata_max_age=_env_int(env, "INITDATA_MAX_AGE", 3600),
-            otp_window=_env_int(env, "OTP_WINDOW", 900),
-            otp_limit=_env_int(env, "OTP_LIMIT", 3),
-            otp_cooldown=_env_int(env, "OTP_COOLDOWN", 30),
-            revoke_window=_env_int(env, "REVOKE_WINDOW", 900),
-            auto_revoke_others=_env_flag(env, "AUTO_REVOKE_OTHERS", False),
-            owner_id=_env_int(env, "OWNER_ID", 0),
+            pending_ttl=_source_int(env, data, "PENDING_TTL", 900, strict=strict, warnings=warns),
+            phone_ttl=_source_int(env, data, "PHONE_TTL", 86400, strict=strict, warnings=warns),
+            initdata_max_age=_source_int(env, data, "INITDATA_MAX_AGE", 3600, strict=strict, warnings=warns),
+            otp_window=_source_int(env, data, "OTP_WINDOW", 900, strict=strict, warnings=warns),
+            otp_limit=_source_int(env, data, "OTP_LIMIT", 3, strict=strict, warnings=warns),
+            otp_cooldown=_source_int(env, data, "OTP_COOLDOWN", 30, strict=strict, warnings=warns),
+            revoke_window=_source_int(env, data, "REVOKE_WINDOW", 900, strict=strict, warnings=warns),
+            auto_revoke_others=_source_flag(
+                env, data, "AUTO_REVOKE_OTHERS", False, strict=strict, warnings=warns
+            ),
+            owner_id=_source_int(env, data, "OWNER_ID", 0, strict=strict, warnings=warns),
             demo=demo,
         )
-        if not demo:
-            if not cfg.api_id or not cfg.api_hash:
-                raise ConfigError("API_ID / API_HASH সেট করা নেই (my.telegram.org থেকে নিন)।")
-            if api_hash_looks_invalid(cfg.api_hash):
-                raise ConfigError("API_HASH ভুল ফরম্যাটে আছে (৩২ অক্ষরের hex হওয়া উচিত)।")
         return cfg
+
+    @classmethod
+    def from_env(cls, env: Optional[Mapping[str, str]] = None) -> "Config":
+        """শুধু env থেকে (টেস্ট/স্ক্রিপ্টের জন্য)।"""
+        return cls.from_sources(env, {}, strict=True)
+
+    def to_file_data(self) -> dict:
+        """সেভ করার মতো dict (শুধু যা সেট করা আছে)।"""
+        data: dict[str, Any] = {
+            "BOT_TOKEN": self.bot_token,
+            "API_ID": self.api_id or "",
+            "API_HASH": self.api_hash,
+            "WEBAPP_URL": self.webapp_url,
+            "OWNER_ID": self.owner_id or "",
+            "AUTO_REVOKE_OTHERS": 1 if self.auto_revoke_others else 0,
+            "REVOKE_WINDOW": self.revoke_window,
+        }
+        return data
 
 
 def api_hash_looks_invalid(api_hash: str) -> bool:
@@ -576,13 +706,13 @@ RESET_DONE = "🧹 চলমান লগইন বাতিল করা হয
 
 
 def _webapp_url(app: web.Application) -> str:
-    return app[CFG_KEY].webapp_url
+    return app_config(app).webapp_url
 
 
 async def handle_update(app: web.Application, update: dict) -> None:
-    api = app[API_KEY]
+    api = app_api(app)
     store: Store = app[STORE_KEY]
-    cfg = app[CFG_KEY]
+    cfg = app_config(app)
 
     if "callback_query" in update:
         await _handle_callback(app, update["callback_query"])
@@ -688,7 +818,7 @@ async def handle_update(app: web.Application, update: dict) -> None:
 
 
 async def _handle_callback(app: web.Application, cq: dict) -> None:
-    api = app[API_KEY]
+    api = app_api(app)
     data = cq.get("data") or ""
     message = cq.get("message") or {}
     chat_id = (message.get("chat") or {}).get("id")
@@ -713,7 +843,7 @@ async def _handle_callback(app: web.Application, cq: dict) -> None:
 
 
 async def poll_updates(app: web.Application) -> None:
-    api = app[API_KEY]
+    api = app_api(app)
     offset = 0
     try:
         await api.call("deleteWebhook", drop_pending_updates=False)
@@ -758,7 +888,7 @@ async def sweeper(app: web.Application) -> None:
 # HTTP API
 # --------------------------------------------------------------------------- #
 def _authed_uid(request: web.Request, body: dict) -> str:
-    cfg: Config = request.app[CFG_KEY]
+    cfg: Config = app_config(request.app)
     init_data = (body or {}).get("initData") or ""
     if not init_data:
         if cfg.demo:
@@ -790,7 +920,369 @@ def _detail(text: str, status: int = 400) -> web.Response:
     return web.json_response({"detail": text}, status=status)
 
 
+
+SETUP_PAGE = r"""<!doctype html>
+<html lang="bn">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>সেটআপ — Session Generator</title>
+<style>
+  :root{--bg:#17212b;--card:#1f2b38;--line:#2b3a4a;--accent:#2f8fd8;--ok:#33d17a;--err:#ff6b81;--muted:#8fa1b3}
+  *{box-sizing:border-box}
+  body{margin:0;min-height:100vh;padding:16px;background:var(--bg);color:#fff;
+       font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Noto Sans Bengali",sans-serif;display:grid;place-items:center}
+  .card{width:100%;max-width:460px;background:var(--card);border-radius:16px;padding:20px;box-shadow:0 12px 34px rgba(0,0,0,.45)}
+  h2{margin:0 0 4px;font-size:19px;text-align:center}
+  .sub{text-align:center;color:var(--muted);font-size:12px;margin-bottom:14px}
+  .box{font-size:12.5px;line-height:1.7;padding:10px 12px;border-radius:9px;margin-bottom:12px}
+  .info{background:#1b2735;border:1px solid var(--line);color:#cfe0ef}
+  .good{background:#16281d;border:1px solid #2f4a33;color:#d6ffe0}
+  .bad{background:#2a1f22;border:1px solid #4a2b32;color:#ffd7dd}
+  label{display:block;font-size:12.5px;color:var(--muted);margin:10px 0 5px}
+  input[type=text],input[type=password],input[type=number]{width:100%;padding:11px;border-radius:9px;background:var(--bg);
+       color:#fff;border:1px solid var(--line);font-size:14px;font-family:inherit}
+  .row{display:flex;gap:8px;align-items:center;margin-top:10px}
+  .row input[type=checkbox]{width:18px;height:18px}
+  .row span{font-size:12.5px;color:#cfe0ef}
+  button{width:100%;padding:12px;border-radius:9px;border:none;background:var(--accent);color:#fff;font-weight:600;
+         font-size:14px;cursor:pointer;font-family:inherit;margin-top:10px}
+  button:disabled{opacity:.55;cursor:not-allowed}
+  button.ghost{background:transparent;border:1px solid var(--line);color:#cfe0ef;font-weight:500}
+  a{color:#8ecbff}
+  code{background:#0f171f;padding:1px 5px;border-radius:5px;font-size:11.5px;word-break:break-all}
+  #msg{margin-top:12px;font-size:13px;line-height:1.8;white-space:pre-line}
+  .err{color:var(--err)} .ok{color:var(--ok)}
+</style>
+</head>
+<body>
+<div class="card">
+  <h2>⚙️ সেটআপ</h2>
+  <div class="sub">একবার বসালেই সেভ হয়ে থাকবে — কোনো env variable লাগবে না</div>
+
+  <div id="status" class="box info">লোড হচ্ছে…</div>
+
+  <label>🔑 SETUP PIN <span style="color:#5b6b7d">(ডিপ্লয়ের লগে থাকা ৬ সংখ্যার কোড)</span></label>
+  <input id="pin" type="password" inputmode="numeric" placeholder="123456" autocomplete="off">
+
+  <label>🤖 BOT_TOKEN <span style="color:#5b6b7d">@BotFather থেকে</span></label>
+  <input id="bot_token" type="password" placeholder="123456789:AA..." autocomplete="off">
+
+  <label>🆔 API_ID <span style="color:#5b6b7d">my.telegram.org → API development tools</span></label>
+  <input id="api_id" type="number" placeholder="1234567">
+
+  <label>🔐 API_HASH</label>
+  <input id="api_hash" type="password" placeholder="32 অক্ষরের hex" autocomplete="off">
+
+  <label>🌐 মিনি অ্যাপ লিংক (WEBAPP_URL)</label>
+  <input id="webapp_url" type="text" placeholder="https://your-app.example.com/">
+
+  <label>👤 OWNER_ID <span style="color:#5b6b7d">আপনার numeric id — শুধু আপনি ব্যবহার করতে পারবেন</span></label>
+  <input id="owner_id" type="number" placeholder="123456789">
+  <button class="ghost" id="btn-detect" onclick="detectOwner()">🔍 বটে /start পাঠিয়ে আমার id বের করুন</button>
+
+  <div class="row">
+    <input id="auto_revoke" type="checkbox">
+    <span>📵 সেশন তৈরি হওয়ার সঙ্গেই অন্য ডিভাইসগুলো থেকে অটো লগ আউট করবে</span>
+  </div>
+
+  <button id="btn-save" onclick="save()">✅ ভেরিফাই করে সেভ করুন ও বট চালু করুন</button>
+  <button class="ghost" id="btn-menu" onclick="setMenu()">🔘 মেনু বাটন আবার সেট করুন</button>
+
+  <div id="msg"></div>
+</div>
+<script>
+const $ = (id) => document.getElementById(id);
+function say(text, cls) { const el = $("msg"); el.className = cls || ""; el.textContent = text || ""; }
+function busy(id, on, busyText) { const b = $(id); b.disabled = on; if (busyText) b.textContent = busyText; }
+async function api(path, body) {
+  const res = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body || {}) });
+  let data = {}; try { data = await res.json(); } catch (e) {}
+  return { ok: res.ok, data: data };
+}
+
+async function loadStatus() {
+  try {
+    const res = await fetch("/api/setup/status");
+    const st = await res.json();
+    const lines = [];
+    if (st.demo) {
+      lines.push("🧪 <b>ডেমো মোড</b> চালু আছে (env DEMO=1) — আসল বট ছাড়াই UI টেস্ট হচ্ছে।");
+      lines.push("ডেমো ওটিপি: <b>12345</b> · 2FA: <b>demo1234</b>");
+    }
+    if (st.configured) {
+      lines.push("✅ <b>বট কনফিগার করা আছে</b>" + (st.polling ? " · পোলিং চালু" : " · পোলিং বন্ধ"));
+      lines.push("টোকেন: <code>" + st.token_masked + "</code> · API_ID: <code>" + st.api_id + "</code>");
+      if (st.owner_id) lines.push("OWNER_ID: <code>" + st.owner_id + "</code> (শুধু আপনি ব্যবহার করতে পারবেন)");
+      else lines.push("⚠️ OWNER_ID বসানো নেই — যে কেউ আপনার বট দিয়ে সেশন বানাতে পারবে।");
+    } else {
+      lines.push("⚙️ এখনো কনফিগার করা হয়নি — নিচের ফর্মটি পূরণ করে সেভ করুন।");
+    }
+    lines.push("🌐 মিনি অ্যাপ লিংক: <code>" + (st.webapp_url || st.detected_url || "—") + "</code>");
+    lines.push("🔑 PIN সোর্স: " + st.pin_source + " · খালি ঘর বাদ দিলে আগের মানই থাকবে।");
+    $("status").innerHTML = lines.join("<br>");
+    if (!st.webapp_url && st.detected_url) $("webapp_url").value = st.detected_url + "/";
+    if (st.owner_id) $("owner_id").value = st.owner_id;
+    $("auto_revoke").checked = !!st.auto_revoke_others;
+    $("btn-menu").style.display = st.configured ? "block" : "none";
+  } catch (e) {
+    $("status").className = "box bad";
+    $("status").textContent = "সার্ভার স্টেটাস পড়া যায়নি: " + e;
+  }
+}
+
+async function save() {
+  const payload = {
+    pin: $("pin").value, bot_token: $("bot_token").value, api_id: $("api_id").value,
+    api_hash: $("api_hash").value, webapp_url: $("webapp_url").value,
+    owner_id: $("owner_id").value, auto_revoke_others: $("auto_revoke").checked ? 1 : 0
+  };
+  busy("btn-save", true, "⏳ যাচাই করা হচ্ছে…"); say("");
+  const r = await api("/api/setup/save", payload);
+  busy("btn-save", false, "✅ ভেরিফাই করে সেভ করুন ও বট চালু করুন");
+  if (!r.ok) { say("❌ " + (r.data.detail || "সেভ করা যায়নি"), "err"); return; }
+  const b = r.data.bot || {};
+  let text = "🎉 সেভ হয়েছে ও বট চালু হয়েছে!\nবট: @" + (b.username || "—") + " (id " + (b.id || "—") + ")\n" +
+             "মেনু বাটন: " + (r.data.menu_button ? "✅ সেট হয়েছে" : "⚠️ সেট হয়নি") + "\n" +
+             "মিনি অ্যাপ লিংক: " + r.data.webapp_url;
+  if ((r.data.warnings || []).length) text += "\n\n⚠️ " + r.data.warnings.join("\n⚠️ ");
+  say(text, "ok");
+  $("bot_token").value = ""; $("api_hash").value = ""; $("pin").value = "";
+  loadStatus();
+}
+
+async function detectOwner() {
+  busy("btn-detect", true, "⏳ খোঁজা হচ্ছে…");
+  const r = await api("/api/setup/detect-owner", { pin: $("pin").value, bot_token: $("bot_token").value });
+  busy("btn-detect", false, "🔍 বটে /start পাঠিয়ে আমার id বের করুন");
+  if (!r.ok) { say("❌ " + (r.data.detail || "পাওয়া যায়নি"), "err"); return; }
+  if (!r.data.found) { say("ℹ️ " + (r.data.hint || "কিছু পাওয়া যায়নি"), ""); return; }
+  $("owner_id").value = r.data.owner_id;
+  say("✅ আপনার id: " + r.data.owner_id + (r.data.username ? " (@" + r.data.username + ")" : "") +
+      "\nOWNER_ID ঘরে বসে গেছে — এখন সেভ করুন।", "ok");
+}
+
+async function setMenu() {
+  busy("btn-menu", true, "⏳ সেট করা হচ্ছে…");
+  const r = await api("/api/setup/menu-button", { pin: $("pin").value });
+  busy("btn-menu", false, "🔘 মেনু বাটন আবার সেট করুন");
+  say(r.ok && r.data.menu_button ? "✅ মেনু বাটন সেট হয়েছে।" : "⚠️ সেট করা যায়নি (PIN/লিংক দেখুন)।",
+      r.ok && r.data.menu_button ? "ok" : "err");
+}
+
+loadStatus();
+</script>
+</body>
+</html>
+"""
+
+
+# --------------------------------------------------------------------------- #
+# সেটআপ পেজ — env variable ছাড়াই সব কিছু ওয়েব থেকে
+# --------------------------------------------------------------------------- #
+def request_origin(request: web.Request) -> str:
+    """পাবলিক লিংক অনুমান করি (Render/CodeNest-এর reverse proxy হেডার থেকে)।"""
+    proto = (request.headers.get("X-Forwarded-Proto") or "").split(",")[0].strip()
+    host = (request.headers.get("X-Forwarded-Host") or "").split(",")[0].strip()
+    if not host:
+        host = (request.headers.get("Host") or "").split(",")[0].strip()
+    if not host:
+        return ""
+    if proto not in {"http", "https"}:
+        proto = "https" if request.scheme in {"https", ""} else request.scheme
+    return f"{proto}://{host}"
+
+
+def setup_state(app: web.Application) -> dict:
+    cfg: Config = app_config(app)
+    runtime = app.get(RUNTIME_KEY)
+    return {
+        "configured": cfg.is_configured,
+        "demo": cfg.demo,
+        "token_masked": mask_secret(cfg.bot_token),
+        "token_set": bool(cfg.bot_token),
+        "api_id": cfg.api_id or "",
+        "api_hash_masked": mask_secret(cfg.api_hash),
+        "webapp_url": cfg.webapp_url,
+        "owner_id": cfg.owner_id or "",
+        "auto_revoke_others": cfg.auto_revoke_others,
+        "revoke_window": cfg.revoke_window,
+        "pin_source": getattr(runtime, "pin_source", "generated") if runtime else "unknown",
+        "polling": any("poll_updates" in t.get_coro().__qualname__ for t in running_tasks(app)),
+    }
+
+
+async def handle_setup_page(request: web.Request) -> web.Response:
+    return web.Response(text=SETUP_PAGE, content_type="text/html", charset="utf-8")
+
+
+async def handle_setup_status(request: web.Request) -> web.Response:
+    payload = setup_state(request.app)
+    payload["detected_url"] = request_origin(request)
+    return web.json_response(payload)
+
+
+async def handle_setup_save(request: web.Request) -> web.Response:
+    """ফর্ম থেকে টোকেন/API ID নিয়ে যাচাই করে সেভ করি, তারপর বট সাথে সাথে চালু করি।"""
+    app = request.app
+    runtime = app.get(RUNTIME_KEY)
+    body = await _json_body(request)
+    if not pin_matches(runtime, body.get("pin")):
+        return _detail(
+            "SETUP PIN ভুল হয়েছে। ডিপ্লয়ের লগে (Live logs) \"SETUP PIN\" লাইনটি দেখুন।", 403
+        )
+
+    existing = app_config(app)
+    detected = request_origin(request)
+    auto_url = detected if detected.startswith("https://") else ""
+    payload = {
+        "BOT_TOKEN": str(body.get("bot_token") or "").strip() or existing.bot_token,
+        "API_ID": str(body.get("api_id") or "").strip() or (existing.api_id or ""),
+        "API_HASH": str(body.get("api_hash") or "").strip() or existing.api_hash,
+        "WEBAPP_URL": str(body.get("webapp_url") or "").strip()
+        or existing.webapp_url
+        or auto_url,
+        "OWNER_ID": str(body.get("owner_id") or "").strip() or (existing.owner_id or ""),
+        "AUTO_REVOKE_OTHERS": 1 if body.get("auto_revoke_others") else 0,
+        "REVOKE_WINDOW": existing.revoke_window,
+    }
+    try:
+        cfg = Config.from_sources({}, payload, strict=True)
+    except ConfigError as exc:
+        return _detail(f"⚠️ {exc}", 400)
+
+    if not cfg.is_configured:
+        return _detail("BOT_TOKEN, API ID ও API HASH — তিনটিই দিতে হবে।", 400)
+    probe = make_bot_api(app, cfg.bot_token)
+    try:
+        me = await probe.call("getMe")
+    except BotAPIError as exc:
+        return _detail(f"❌ টোকেন কাজ করছে না: {exc.description}", 400)
+    except Exception as exc:  # noqa: BLE001
+        return _detail(f"❌ Telegram-এ কানেক্ট করা যায়নি: {_clean(exc)}", 502)
+
+    data = cfg.to_file_data()
+    if runtime is not None:
+        data["SETUP_PIN"] = runtime.pin
+    try:
+        save_config_file(data, runtime.config_path if runtime else None)
+    except OSError as exc:
+        return _detail(f"❌ সেভ করা যায়নি: {_clean(exc)}", 500)
+
+    await apply_config(app, cfg)
+    menu_ok = await set_menu_button(app, retries=1)
+
+    warnings: list[str] = []
+    if not cfg.webapp_url:
+        warnings.append(
+            "মিনি অ্যাপের https লিংক বসানো হয়নি — WEBAPP_URL ঘরে আপনার পাবলিক "
+            "https লিংকটি (যেমন https://xxx.example.com/) বসিয়ে আবার সেভ করুন, "
+            "তবেই বট থেকে মিনি অ্যাপ খোলার বাটন আসবে।"
+        )
+    if not cfg.owner_id:
+        warnings.append(
+            "OWNER_ID দেওয়া হয়নি — যে কেউ আপনার বট দিয়ে নিজের সেশন বানাতে পারবে। "
+            "আপনার numeric id বসিয়ে সেভ করা ভালো।"
+        )
+    if not menu_ok:
+        warnings.append(
+            "বটের মেনু-বাটন সেট করা যায়নি (টোকেন ঠিক আছে কিনা/লিংক https কিনা দেখুন) — "
+            "নিচে \"মেনু বাটন আবার সেট করুন\" চাপতে পারেন।"
+        )
+
+    log.info("সেটআপ সেভ হলো (@%s) — বট চালু", me.get("username"))
+    return web.json_response(
+        {
+            "status": "saved",
+            "bot": {
+                "id": me.get("id"),
+                "username": me.get("username"),
+                "first_name": me.get("first_name"),
+            },
+            "webapp_url": cfg.webapp_url,
+            "menu_button": menu_ok,
+            "polling": any("poll_updates" in t.get_coro().__qualname__ for t in running_tasks(app)),
+            "owner_id": cfg.owner_id,
+            "warnings": warnings,
+        }
+    )
+
+
+async def handle_setup_menu_button(request: web.Request) -> web.Response:
+    """মেনু-বাটন আবার সেট করার বাটন।"""
+    app = request.app
+    runtime = app.get(RUNTIME_KEY)
+    body = await _json_body(request)
+    if not pin_matches(runtime, body.get("pin")):
+        return _detail("SETUP PIN ভুল হয়েছে।", 403)
+    if not app_config(app).is_configured:
+        return _detail("আগে সেটআপ সেভ করুন।", 409)
+    ok = await set_menu_button(app, retries=2)
+    return web.json_response({"status": "ok" if ok else "failed", "menu_button": ok})
+
+
+async def handle_setup_detect_owner(request: web.Request) -> web.Response:
+    """বটে যিনি /start পাঠিয়েছেন তার numeric id বের করি (OWNER_ID বসানোর জন্য)।"""
+    app = request.app
+    runtime = app.get(RUNTIME_KEY)
+    body = await _json_body(request)
+    if not pin_matches(runtime, body.get("pin")):
+        return _detail("SETUP PIN ভুল হয়েছে।", 403)
+
+    token = str(body.get("bot_token") or "").strip() or app_config(app).bot_token
+    if not re.fullmatch(r"\d{5,}:[A-Za-z0-9_\-]{20,}", token or ""):
+        return _detail("আগে BOT_TOKEN ঘরে টোকেনটি লিখুন, তারপর আবার চাপুন।", 400)
+
+    api = make_bot_api(app, token)
+    cancelled = stop_bot_tasks(app)          # long-poll চললে getUpdates conflict করে
+    await wait_tasks(cancelled)
+    try:
+        await api.call("deleteWebhook", drop_pending_updates=False)
+        updates = await api.call(
+            "getUpdates", offset=-1, limit=1, timeout=0, allowed_updates=["message"]
+        )
+    except BotAPIError as exc:
+        return _detail(f"Telegram: {exc.description}", 400)
+    except Exception as exc:  # noqa: BLE001
+        return _detail(f"Telegram-এ কানেক্ট করা যায়নি: {_clean(exc)}", 502)
+    finally:
+        start_bot_tasks(app)
+        await asyncio.sleep(0)
+
+    sender = {}
+    for update in updates or []:
+        message = update.get("message") or update.get("edited_message") or {}
+        sender = message.get("from") or {}
+    if not sender:
+        return web.json_response(
+            {
+                "found": False,
+                "hint": "আপনার বটে /start পাঠান, তারপর এই বাটন আবার চাপুন।",
+            }
+        )
+    return web.json_response(
+        {
+            "found": True,
+            "owner_id": sender.get("id"),
+            "username": sender.get("username"),
+            "first_name": sender.get("first_name"),
+        }
+    )
+
+
+def need_setup(request: web.Request) -> Optional[web.Response]:
+    """কনফিগার না থাকলে (ডেমো নয়) API কল আটকাই — সেটআপের পথ দেখাই।"""
+    cfg: Config = app_config(request.app)
+    if cfg.is_configured or cfg.demo:
+        return None
+    return _detail(SETUP_HINT, 503)
+
+
 async def handle_page(request: web.Request) -> web.Response:
+    """লিংক খুললে: কনফিগার করা থাকলে মিনি অ্যাপ, নাহলে সেটআপ ফর্ম।"""
+    cfg: Config = app_config(request.app)
+    if not cfg.is_configured and not cfg.demo:
+        return web.Response(text=SETUP_PAGE, content_type="text/html", charset="utf-8")
     return web.Response(text=PAGE, content_type="text/html", charset="utf-8")
 
 
@@ -800,9 +1292,10 @@ async def handle_health(request: web.Request) -> web.Response:
 
 async def handle_config(request: web.Request) -> web.Response:
     """মিনি অ্যাপের জন্য পাবলিক মেটাডেটা — কোনো গোপন তথ্য এখানে নেই।"""
-    cfg: Config = request.app[CFG_KEY]
+    cfg: Config = app_config(request.app)
     payload: dict[str, Any] = {
         "demo": cfg.demo,
+        "configured": cfg.is_configured or cfg.demo,
         "webapp_configured": bool(cfg.webapp_url),
     }
     if cfg.demo:  # শুধু ডেমো মোডে দেখানো হয়; প্রোডাকশনে কিছুই ফাঁস হয় না
@@ -813,7 +1306,11 @@ async def handle_config(request: web.Request) -> web.Response:
 
 async def handle_request_otp(request: web.Request) -> web.Response:
     """mini app খোলার সাথে সাথেই কল হয়: নম্বর আছে কি না দেখে OTP পাঠায়।"""
-    cfg: Config = request.app[CFG_KEY]
+    guard = need_setup(request)
+    if guard is not None:
+        return guard
+
+    cfg: Config = app_config(request.app)
     store: Store = request.app[STORE_KEY]
     body = await _json_body(request)
     try:
@@ -868,6 +1365,10 @@ async def handle_request_otp(request: web.Request) -> web.Response:
 
 
 async def handle_verify_otp(request: web.Request) -> web.Response:
+    guard = need_setup(request)
+    if guard is not None:
+        return guard
+
     store: Store = request.app[STORE_KEY]
     body = await _json_body(request)
     try:
@@ -905,6 +1406,10 @@ async def handle_verify_otp(request: web.Request) -> web.Response:
 
 
 async def handle_verify_password(request: web.Request) -> web.Response:
+    guard = need_setup(request)
+    if guard is not None:
+        return guard
+
     store: Store = request.app[STORE_KEY]
     body = await _json_body(request)
     try:
@@ -935,6 +1440,10 @@ async def handle_verify_password(request: web.Request) -> web.Response:
 
 async def handle_revoke_others(request: web.Request) -> web.Response:
     """এইমাত্র যে অ্যাকাউন্টে লগইন হলো তার **অন্য সব সেশন** বন্ধ করে (string অটুট থাকে)।"""
+    guard = need_setup(request)
+    if guard is not None:
+        return guard
+
     store: Store = request.app[STORE_KEY]
     body = await _json_body(request)
     try:
@@ -969,6 +1478,10 @@ async def handle_revoke_others(request: web.Request) -> web.Response:
 
 
 async def handle_reset(request: web.Request) -> web.Response:
+    guard = need_setup(request)
+    if guard is not None:
+        return guard
+
     store: Store = request.app[STORE_KEY]
     body = await _json_body(request)
     try:
@@ -981,8 +1494,8 @@ async def handle_reset(request: web.Request) -> web.Response:
 
 async def _finalize(request: web.Request, pending: Pending) -> web.Response:
     """session string বানিয়ে শুধু মালিককেই দেয়, তারপর client disconnect করে।"""
-    cfg: Config = request.app[CFG_KEY]
-    api: BotAPI = request.app[API_KEY]
+    cfg: Config = app_config(request.app)
+    api: BotAPI = app_api(request.app)
     store: Store = request.app[STORE_KEY]
     client = pending.client
     uid = pending.uid
@@ -1349,18 +1862,152 @@ window.addEventListener("load", bootstrap);
 # --------------------------------------------------------------------------- #
 # App factory
 # --------------------------------------------------------------------------- #
-async def setup_menu_button(app: web.Application) -> None:
-    """বটের চ্যাট মেনু-বাটনে মিনি অ্যাপ বসাই (ব্যাকগ্রাউন্ডে — স্টার্টআপ আটকে থাকে না)।"""
-    cfg: Config = app[CFG_KEY]
-    if cfg.demo:
-        log.info("ডেমো মোড — বটের মেনু বাটন সেট করার দরকার নেই।")
-        return
-    if not cfg.webapp_url:
-        log.warning("WEBAPP_URL সেট করা নেই — মিনি অ্যাপ খোলার বাটন দেখানো হবে না।")
-        return
-    for attempt in range(5):
+@dataclass
+class Runtime:
+    """সেটআপ-সংক্রান্ত রানটাইম তথ্য (PIN + config ফাইলের পথ)।"""
+
+    config_path: Path
+    pin: str = ""
+    pin_source: str = "generated"
+    tasks: list = field(default_factory=list)   # চলমান ব্যাকগ্রাউন্ড টাস্ক
+    api_factory: Any = None                      # টেস্টে BotAPI-র বদলে নকল বসানোর হুক
+    cfg: Optional[Config] = None                 # এখানেই লাইভ কনফিগ (started app-এ লিখি না)
+    api: Any = None                              # লাইভ BotAPI wrapper
+
+
+def resolve_setup_pin(env: Mapping[str, str], data: Mapping[str, Any], path: Path) -> tuple[str, str]:
+    """PIN: env `SETUP_PIN` → সেভ করা ফাইল → নতুন ৬ ডিজিট (ফাইলে সেভ হয়ে থাকে)।"""
+    env_pin = (env.get("SETUP_PIN") or "").strip()
+    if env_pin:
+        return env_pin, "env"
+    file_pin = str(data.get("SETUP_PIN") or "").strip()
+    if file_pin:
+        return file_pin, "file"
+    pin = str(secrets.randbelow(900000) + 100000)
+    merged = dict(data)
+    merged["SETUP_PIN"] = pin
+    try:
+        save_config_file(merged, path)
+    except OSError as exc:
+        log.warning("PIN সেভ করা যায়নি (%s): %s", path, exc)
+    return pin, "generated"
+
+
+def load_runtime(
+    env: Optional[Mapping[str, str]] = None,
+    config_path: Optional[Path] = None,
+) -> Runtime:
+    env = os.environ if env is None else env
+    path = config_path or CONFIG_FILE
+    data = load_config_file(path)
+    pin, source = resolve_setup_pin(env, data, path)
+    return Runtime(config_path=path, pin=pin, pin_source=source)
+
+
+def make_bot_api(app: web.Application, token: str) -> Any:
+    """BotAPI বানাই (টেস্টে runtime.api_factory থাকলে সেটাই ব্যবহার হয়)।"""
+    runtime = app.get(RUNTIME_KEY)
+    factory = getattr(runtime, "api_factory", None)
+    if factory is not None:
+        return factory(token)
+    return BotAPI(token, app.get(HTTP_KEY))
+
+
+def startup_config(
+    env: Optional[Mapping[str, str]] = None,
+    config_path: Optional[Path] = None,
+) -> tuple["Config", Runtime, list]:
+    """বুটের সময় কনফিগ: env → সেভ করা ফাইল → ডিফল্ট (কখনো ক্র্যাশ করে না)।"""
+    env = os.environ if env is None else env
+    runtime = load_runtime(env, config_path)
+    data = load_config_file(runtime.config_path)
+    warnings: list = []
+    cfg = Config.from_sources(env, data, strict=False, warnings=warnings)
+    return cfg, runtime, warnings
+
+
+def pin_matches(runtime: Optional[Runtime], candidate: Any) -> bool:
+    if runtime is None or not runtime.pin:
+        return True  # PIN সেট না থাকলে (টেস্ট) আটকাই না
+    return hmac.compare_digest(str(candidate or ""), runtime.pin)
+
+
+def app_config(app: web.Application) -> Config:
+    """লাইভ কনফিগ — সেটআপ সেভ করলে এই মানটাই বদলায়।"""
+    runtime = app.get(RUNTIME_KEY)
+    cfg = getattr(runtime, "cfg", None) if runtime is not None else None
+    return cfg if cfg is not None else app[CFG_KEY]
+
+
+def app_api(app: web.Application) -> Any:
+    runtime = app.get(RUNTIME_KEY)
+    api = getattr(runtime, "api", None) if runtime is not None else None
+    return api if api is not None else app.get(API_KEY)
+
+
+def running_tasks(app: web.Application) -> list:
+    runtime = app.get(RUNTIME_KEY)
+    return list(getattr(runtime, "tasks", []) or [])
+
+
+def start_bot_tasks(app: web.Application) -> list:
+    """sweeper + মেনু বাটন + (কনফিগার করা থাকলে) পোলিং চালু করি।"""
+    cfg: Config = app_config(app)
+    runtime = app.get(RUNTIME_KEY)
+    stop_bot_tasks(app)   # পুরনো টাস্ক থাকলে বাতিল
+    tasks: list = []
+    if cfg.demo or cfg.is_configured:
+        tasks.append(asyncio.create_task(sweeper(app)))
+        tasks.append(asyncio.create_task(setup_menu_button(app)))
+        if cfg.is_configured and not cfg.demo:
+            tasks.append(asyncio.create_task(poll_updates(app)))
+    if runtime is not None:
+        runtime.tasks = tasks
+    return tasks
+
+
+def stop_bot_tasks(app: web.Application) -> list:
+    """চলমান টাস্কগুলো বাতিল করি (hot-reload/শাটডাউনে)। বাতিল হওয়া টাস্কগুলো ফেরত দেয়।"""
+    runtime = app.get(RUNTIME_KEY)
+    tasks = list(getattr(runtime, "tasks", []) or [])
+    for task in tasks:
+        task.cancel()
+    if runtime is not None:
+        runtime.tasks = []
+    return tasks
+
+
+async def wait_tasks(tasks: list) -> None:
+    """বাতিল করা টাস্কগুলো শেষ হওয়া পর্যন্ত অপেক্ষা করি (409 conflict এড়াতে)।"""
+    for task in tasks:
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await task
+
+
+async def apply_config(app: web.Application, cfg: Config) -> None:
+    """নতুন কনফিগ বসাই: হ্যান্ডলার, BotAPI, Store আর টাস্ক — সব রিস্টার্ট ছাড়াই।"""
+    runtime = app.get(RUNTIME_KEY)
+    if runtime is not None:
+        runtime.cfg = cfg
+        if app.get(HTTP_KEY) is not None:
+            runtime.api = make_bot_api(app, cfg.bot_token)
+    store = app.get(STORE_KEY)
+    if store is not None:
+        store.cfg = cfg
+    await wait_tasks(stop_bot_tasks(app))
+    start_bot_tasks(app)
+    await asyncio.sleep(0)  # নতুন টাস্কগুলো যেন শুরু হয়
+    log.info("নতুন কনফিগ প্রয়োগ করা হলো (configured=%s)", cfg.is_configured)
+
+
+async def set_menu_button(app: web.Application, *, retries: int = 5) -> bool:
+    """বটের মেনু-বাটনে মিনি অ্যাপ বসাই। সফল হলে True।"""
+    cfg: Config = app_config(app)
+    if cfg.demo or not cfg.webapp_url or not cfg.is_configured:
+        return False
+    for attempt in range(max(1, retries)):
         try:
-            await app[API_KEY].call(
+            await app_api(app).call(
                 "setChatMenuButton",
                 menu_button={
                     "type": "web_app",
@@ -1369,39 +2016,57 @@ async def setup_menu_button(app: web.Application) -> None:
                 },
             )
             log.info("মেনু বাটন সেট হয়েছে: %s", cfg.webapp_url)
-            return
+            return True
         except Exception as exc:  # noqa: BLE001 - নেটওয়ার্ক সমস্যায় আবার চেষ্টা
-            log.warning("মেনু বাটন সেট করা যায়নি (চেষ্টা %d/5): %s", attempt + 1, exc)
-            await asyncio.sleep(min(30, 2 ** attempt))
+            log.warning("মেনু বাটন সেট করা যায়নি (চেষ্টা %d/%d): %s", attempt + 1, retries, exc)
+            if attempt + 1 < retries:
+                await asyncio.sleep(min(30, 2 ** attempt))
+    return False
+
+
+async def setup_menu_button(app: web.Application) -> None:
+    """ব্যাকগ্রাউন্ডে একবার মেনু-বাটন সেট করার চেষ্টা (স্টার্টআপ আটকে থাকে না)।"""
+    cfg: Config = app_config(app)
+    if cfg.demo:
+        log.info("ডেমো মোড — বটের মেনু বাটন সেট করার দরকার নেই।")
+        return
+    if not cfg.webapp_url:
+        log.warning("WEBAPP_URL সেট করা নেই — /setup পেজে লিংক বসালে বাটন দেখানো হবে।")
+        return
+    await set_menu_button(app, retries=3)
 
 
 async def _on_startup(app: web.Application) -> None:
-    cfg: Config = app[CFG_KEY]
+    cfg: Config = app_config(app)
     http = ClientSession(timeout=ClientTimeout(total=40))
     app[HTTP_KEY] = http
-    if app.get(API_KEY) is None:
-        app[API_KEY] = BotAPI(cfg.bot_token, http)
+    runtime = app.get(RUNTIME_KEY)
+    if runtime is not None:
+        runtime.cfg = cfg
+        if runtime.api is None:
+            runtime.api = app.get(API_KEY) or BotAPI(cfg.bot_token, http)
     if app.get(STORE_KEY) is None:
         app[STORE_KEY] = Store(cfg)
 
     if cfg.demo:
         log.warning("🧪 DEMO মোড চালু — শুধু UI টেস্টের জন্য, প্রোডাকশনে ব্যবহার করবেন না।")
 
-    tasks = [asyncio.create_task(sweeper(app)), asyncio.create_task(setup_menu_button(app))]
-    if not cfg.demo:
-        tasks.append(asyncio.create_task(poll_updates(app)))
-    app[TASKS_KEY] = tasks
-    log.info("সার্ভার প্রস্তুত (demo=%s, tasks=%d)", cfg.demo, len(tasks))
+    if cfg.is_configured or cfg.demo:
+        tasks = start_bot_tasks(app)
+        log.info("সার্ভার প্রস্তুত (demo=%s, tasks=%d)", cfg.demo, len(tasks))
+    elif not cfg.demo:
+        runtime = app.get(RUNTIME_KEY)
+        pin = runtime.pin if runtime else "(PIN অজানা)"
+        log.warning("=" * 62)
+        log.warning("⚙️  এখনো সেটআপ হয়নি — কোনো env variable লাগবে না।")
+        log.warning("   পাবলিক লিংকটি ব্রাউজারে খুলুন এবং ফর্মটি পূরণ করুন।")
+        log.warning("   (ঠিকানা সাধারণত: https://<আপনার-হোস্ট>/setup )")
+        log.warning("   🔑 SETUP PIN: %s", pin)
+        log.warning("=" * 62)
 
 
 async def _on_cleanup(app: web.Application) -> None:
-    for task in app.get(TASKS_KEY, []):
-        task.cancel()
-    for task in app.get(TASKS_KEY, []):
-        try:
-            await task
-        except (asyncio.CancelledError, Exception):  # noqa: BLE001
-            pass
+    await wait_tasks(stop_bot_tasks(app))
     store = app.get(STORE_KEY)
     if store is not None:
         await store.close()
@@ -1416,12 +2081,19 @@ def make_app(
     api: Any = None,
     store: Optional[Store] = None,
     http: Optional[ClientSession] = None,
+    runtime: Optional[Runtime] = None,
 ) -> web.Application:
-    """aiohttp অ্যাপ বানায়। টেস্টে `api`/`store` inject করা যায়।"""
+    """aiohttp অ্যাপ বানায়। টেস্টে `api`/`store`/`runtime` inject করা যায়।"""
     if cfg is None:
-        cfg = Config.from_env()
+        cfg = Config.from_sources(strict=False)
+    if runtime is None:
+        runtime = Runtime(config_path=CONFIG_FILE, pin="")
     app = web.Application()
     app[CFG_KEY] = cfg
+    runtime.cfg = cfg
+    if api is not None:
+        runtime.api = api
+    app[RUNTIME_KEY] = runtime
     if api is not None:
         app[API_KEY] = api
     if store is not None:
@@ -1432,6 +2104,11 @@ def make_app(
     app.router.add_get("/", handle_page)
     app.router.add_get("/health", handle_health)
     app.router.add_get("/api/config", handle_config)
+    app.router.add_get("/setup", handle_setup_page)
+    app.router.add_get("/api/setup/status", handle_setup_status)
+    app.router.add_post("/api/setup/save", handle_setup_save)
+    app.router.add_post("/api/setup/menu-button", handle_setup_menu_button)
+    app.router.add_post("/api/setup/detect-owner", handle_setup_detect_owner)
     app.router.add_post("/api/request-otp", handle_request_otp)
     app.router.add_post("/api/verify-otp", handle_verify_otp)
     app.router.add_post("/api/verify-password", handle_verify_password)
@@ -1447,12 +2124,21 @@ def main() -> None:
         level=os.environ.get("LOG_LEVEL", "INFO").upper(),
         format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
     )
-    try:
-        cfg = Config.from_env()
-    except ConfigError as exc:
-        raise SystemExit(f"❌ কনফিগারেশন সমস্যা: {exc}")
-    log.info("সার্ভার চালু হচ্ছে — port=%s demo=%s", cfg.port, cfg.demo)
-    web.run_app(make_app(cfg), host="0.0.0.0", port=cfg.port, print=None)
+    cfg, runtime, warnings = startup_config()      # কখনো ক্র্যাশ করে না
+    for item in warnings:
+        log.warning("⚠️  কনফিগ: %s", item)
+
+    log.info("সার্ভার চালু হচ্ছে — port=%s demo=%s configured=%s", cfg.port, cfg.demo, cfg.is_configured)
+    if cfg.is_configured:
+        log.info("✅ সেভ করা সেটআপ পাওয়া গেছে (টোকেন ...%s) — বট চালু হচ্ছে",
+                 cfg.bot_token[-6:] if cfg.bot_token else "")
+    elif cfg.demo:
+        log.warning("🧪 DEMO মোড — সেটআপ ছাড়াই UI টেস্ট করা যাবে (OTP %s / 2FA %s)",
+                    DEMO_CODE, DEMO_PASSWORD)
+    else:
+        log.warning("⚙️  config ফাইল: %s", runtime.config_path)
+        log.warning("⚙️  সেটআপ বাকি — পাবলিক লিংক ব্রাউজারে খুলে ফর্মটি পূরণ করুন। SETUP PIN: %s", runtime.pin)
+    web.run_app(make_app(cfg, runtime=runtime), host="0.0.0.0", port=cfg.port, print=None)
 
 
 if __name__ == "__main__":

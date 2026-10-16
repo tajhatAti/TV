@@ -5,6 +5,8 @@ __pycache__/
 venv/
 .env
 .env.*
+data/
+config.json
 !.env.example
 *.session
 *.session-journal

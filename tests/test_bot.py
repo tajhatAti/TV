@@ -1,4 +1,4 @@
-"""bot.py-র সম্পূর্ণ টেস্ট স্যুট (কোনো আসল Telegram কল ছাড়াই)।"""
+"""main.py-র সম্পূর্ণ টেস্ট স্যুট (কোনো আসল Telegram কল ছাড়াই)।"""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-import bot as botmod
+import main as botmod
 from conftest import (
     BOT_TOKEN,
     USER_A,
@@ -72,11 +72,18 @@ def test_init_data_ignores_signature_field():
 # --------------------------------------------------------------------------- #
 # ২. কনফিগ
 # --------------------------------------------------------------------------- #
-def test_config_requires_bot_token_and_api_hash():
+def test_config_without_env_is_unconfigured_not_crash():
+    """env ছাড়াও সার্ভার চলে — ক্র্যাশ নয়, শুধু সেটআপ বাকি থাকল।"""
+    cfg = botmod.Config.from_env({})
+    assert cfg.is_configured is False
+    assert botmod.Config.from_env({"BOT_TOKEN": BOT_TOKEN, "API_ID": "1"}).is_configured is False
+
+
+def test_config_strict_mode_rejects_bad_token_and_hash():
     with pytest.raises(botmod.ConfigError, match="BOT_TOKEN"):
-        botmod.Config.from_env({})
+        botmod.Config.from_env({"BOT_TOKEN": "ভুল-টোকেন", "API_ID": "1", "API_HASH": "a" * 32})
     with pytest.raises(botmod.ConfigError, match="API_HASH"):
-        botmod.Config.from_env({"BOT_TOKEN": BOT_TOKEN, "API_ID": "1"})
+        botmod.Config.from_env({"BOT_TOKEN": BOT_TOKEN, "API_ID": "1", "API_HASH": "কোনো-হ্যাশ"})
 
 
 def test_config_requires_https_webapp_url():
@@ -110,7 +117,7 @@ def test_config_rejects_bad_numbers():
 
 def test_source_has_no_hardcoded_credentials():
     """কোডে যেন কোনো bot token / api hash হার্ডকোড না থাকে।"""
-    source = (ROOT / "bot.py").read_text(encoding="utf-8")
+    source = (ROOT / "main.py").read_text(encoding="utf-8")
     assert not re.search(r"\d{8,12}:[A-Za-z0-9_\-]{30,}", source), "bot token হার্ডকোড করা আছে"
     assert not re.search(r"API_HASH\s*=\s*[\"']", source), "API_HASH হার্ডকোড করা আছে"
     assert not re.search(r"LOG_CHANNEL", source), "সেশন লগ চ্যানেলের অবশিষ্টাংশ আছে"
@@ -764,7 +771,7 @@ async def test_task_wiring_demo_vs_live():
     client = TestClient(TestServer(demo_app))
     await client.start_server()
     try:
-        names = {task.get_coro().__qualname__ for task in demo_app[botmod.TASKS_KEY]}
+        names = {task.get_coro().__qualname__ for task in botmod.running_tasks(demo_app)}
         assert not any("poll_updates" in n for n in names), f"ডেমো মোডে polling চলছে: {names}"
         assert any("sweeper" in n for n in names)
     finally:
@@ -776,7 +783,7 @@ async def test_task_wiring_demo_vs_live():
     client = TestClient(TestServer(live_app))
     await client.start_server()
     try:
-        names = {task.get_coro().__qualname__ for task in live_app[botmod.TASKS_KEY]}
+        names = {task.get_coro().__qualname__ for task in botmod.running_tasks(live_app)}
         assert any("poll_updates" in n for n in names), f"লাইভ মোডে polling নেই: {names}"
     finally:
         await client.close()

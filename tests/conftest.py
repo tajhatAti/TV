@@ -18,7 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-import bot as botmod  # noqa: E402
+import main as botmod  # noqa: E402
 
 BOT_TOKEN = "1112223333:TEST-TOKEN-not-a-real-credential"
 USER_A = {"id": 1000001, "first_name": "A", "username": "alpha", "language_code": "bn"}
@@ -63,10 +63,17 @@ class FakeAPI:
         self.fail_send_message = False
         self.incoming: list[dict] = []
         self.offsets: list[int] = []
+        self.last_update: list[dict] = []
+        self.fail_methods: dict[str, str] = {}
+        self.network_error = False
+        self.get_me_result = {"id": 424242, "username": "my_test_bot", "first_name": "Test Bot"}
 
     async def call(self, method: str, **params: Any) -> Any:
         if method == "getUpdates":
             self.offsets.append(params.get("offset"))
+            if params.get("offset") == -1:      # detect-owner একক কল
+                self.calls.append((method, params))
+                return self.last_update
             if self.incoming:
                 batch, self.incoming = self.incoming[:], []
                 return batch
@@ -76,8 +83,16 @@ class FakeAPI:
             await asyncio.sleep(30)
             return []
         self.calls.append((method, params))
+        if method in self.fail_methods:
+            raise botmod.BotAPIError(method, self.fail_methods[method], 400)
+        if self.network_error:
+            raise OSError("network is unreachable")
         if method == "sendMessage" and self.fail_send_message:
             raise botmod.BotAPIError(method, "chat not found", 400)
+        if method == "getMe":
+            return self.get_me_result
+        if method in {"setChatMenuButton", "deleteWebhook"}:
+            return True
         return {"message_id": len(self.calls)}
 
     def methods(self) -> list[str]:
@@ -231,9 +246,17 @@ def store(cfg: botmod.Config, telethon: FakeTelethon) -> botmod.Store:
     return botmod.Store(cfg, client_factory=telethon)
 
 
+@pytest.fixture
+def runtime(tmp_path, fake_api) -> botmod.Runtime:
+    return botmod.Runtime(
+        config_path=tmp_path / "config.json", pin="424242", pin_source="test",
+        api_factory=lambda token: fake_api,
+    )
+
+
 @pytest_asyncio.fixture
-async def web(cfg: botmod.Config, fake_api: FakeAPI, store: botmod.Store):
-    app = botmod.make_app(cfg, api=fake_api, store=store)
+async def web(cfg: botmod.Config, fake_api: FakeAPI, store: botmod.Store, runtime):
+    app = botmod.make_app(cfg, api=fake_api, store=store, runtime=runtime)
     client = TestClient(TestServer(app))
     await client.start_server()
     try:
@@ -242,8 +265,8 @@ async def web(cfg: botmod.Config, fake_api: FakeAPI, store: botmod.Store):
         await client.close()
 
 
-async def post(client: TestClient, path: str, payload: dict) -> tuple[int, dict]:
-    resp = await client.post(path, json=payload)
+async def post(client: TestClient, path: str, payload: dict, headers: Optional[dict] = None) -> tuple[int, dict]:
+    resp = await client.post(path, json=payload, headers=headers or {})
     try:
         data = await resp.json()
     except Exception:  # noqa: BLE001
