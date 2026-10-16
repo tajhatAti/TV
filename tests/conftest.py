@@ -248,10 +248,7 @@ def store(cfg: botmod.Config, telethon: FakeTelethon) -> botmod.Store:
 
 @pytest.fixture
 def runtime(tmp_path, fake_api) -> botmod.Runtime:
-    return botmod.Runtime(
-        config_path=tmp_path / "config.json", pin="424242", pin_source="test",
-        api_factory=lambda token: fake_api,
-    )
+    return botmod.Runtime(config_path=tmp_path / "config.json", api_factory=lambda token: fake_api)
 
 
 @pytest_asyncio.fixture

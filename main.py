@@ -5,9 +5,8 @@
 সার্ভার সাথে সাথেই চালু হয় — env না পেলে ক্র্যাশ করে না। পাবলিক লিংক ব্রাউজারে
 খুললে **সেটআপ ফর্ম** আসে; ওখানেই BOT_TOKEN, API_ID, API_HASH (এবং চাইলে OWNER_ID)
 বসিয়ে "ভেরিফাই করে সেভ" চাপলেই বট চালু হয়ে যায়। মানগুলো `data/config.json`-এ
-সেভ থাকে, তাই পরেরবার/রিডিপ্লয়ে আর দিতে হয় না। সেভ করার জন্য ডিপ্লয়ের লগে
-দেখানো ছোট **SETUP PIN** লাগে (পাবলিক লিংকে কেউ টোকেন বদলে বট হাইজ্যাক করা
-আটকাতে)। চাইলে env দিয়েও সব কিছু দেওয়া যায় — env সবসময় ফাইলের উপরে।
+সেভ থাকে, তাই পরেরবার/রিডিপ্লয়ে আর দিতে হয় না — কোনো PIN/পাসওয়ার্ড লাগে না।
+(চাইলে env দিয়েও সব দেওয়া যায়; env সবসময় ফাইলের উপরে — কিন্তু দরকার নেই।)
 
 কীভাবে কাজ করে
 ---------------
@@ -50,7 +49,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable, Mapping, Optional
-from urllib.parse import parse_qsl
+from urllib.parse import parse_qsl, urlsplit
 
 from aiohttp import ClientSession, ClientTimeout, web
 from telethon import TelegramClient
@@ -961,9 +960,7 @@ SETUP_PAGE = r"""<!doctype html>
   <div class="sub">একবার বসালেই সেভ হয়ে থাকবে — কোনো env variable লাগবে না</div>
 
   <div id="status" class="box info">লোড হচ্ছে…</div>
-
-  <label>🔑 SETUP PIN <span style="color:#5b6b7d">(ডিপ্লয়ের লগে থাকা ৬ সংখ্যার কোড)</span></label>
-  <input id="pin" type="password" inputmode="numeric" placeholder="123456" autocomplete="off">
+  <div class="box info">🔗 এই লিংকটা শুধু আপনার জন্য — কাউকে দেবেন না, নইলে সে-ও আপনার বটের টোকেন বদলাতে পারবে।</div>
 
   <label>🤖 BOT_TOKEN <span style="color:#5b6b7d">@BotFather থেকে</span></label>
   <input id="bot_token" type="password" placeholder="123456789:AA..." autocomplete="off">
@@ -1019,7 +1016,7 @@ async function loadStatus() {
       lines.push("⚙️ এখনো কনফিগার করা হয়নি — নিচের ফর্মটি পূরণ করে সেভ করুন।");
     }
     lines.push("🌐 মিনি অ্যাপ লিংক: <code>" + (st.webapp_url || st.detected_url || "—") + "</code>");
-    lines.push("🔑 PIN সোর্স: " + st.pin_source + " · খালি ঘর বাদ দিলে আগের মানই থাকবে।");
+    lines.push("ℹ️ খালি ঘর বাদ দিলে আগের মানই থাকবে — টোকেন নতুন করে দিলে সব আগের তথ্য থেকে যাবে।");
     $("status").innerHTML = lines.join("<br>");
     if (!st.webapp_url && st.detected_url) $("webapp_url").value = st.detected_url + "/";
     if (st.owner_id) $("owner_id").value = st.owner_id;
@@ -1033,7 +1030,7 @@ async function loadStatus() {
 
 async function save() {
   const payload = {
-    pin: $("pin").value, bot_token: $("bot_token").value, api_id: $("api_id").value,
+    bot_token: $("bot_token").value, api_id: $("api_id").value,
     api_hash: $("api_hash").value, webapp_url: $("webapp_url").value,
     owner_id: $("owner_id").value, auto_revoke_others: $("auto_revoke").checked ? 1 : 0
   };
@@ -1047,13 +1044,13 @@ async function save() {
              "মিনি অ্যাপ লিংক: " + r.data.webapp_url;
   if ((r.data.warnings || []).length) text += "\n\n⚠️ " + r.data.warnings.join("\n⚠️ ");
   say(text, "ok");
-  $("bot_token").value = ""; $("api_hash").value = ""; $("pin").value = "";
+  $("bot_token").value = ""; $("api_hash").value = "";
   loadStatus();
 }
 
 async function detectOwner() {
   busy("btn-detect", true, "⏳ খোঁজা হচ্ছে…");
-  const r = await api("/api/setup/detect-owner", { pin: $("pin").value, bot_token: $("bot_token").value });
+  const r = await api("/api/setup/detect-owner", { bot_token: $("bot_token").value });
   busy("btn-detect", false, "🔍 বটে /start পাঠিয়ে আমার id বের করুন");
   if (!r.ok) { say("❌ " + (r.data.detail || "পাওয়া যায়নি"), "err"); return; }
   if (!r.data.found) { say("ℹ️ " + (r.data.hint || "কিছু পাওয়া যায়নি"), ""); return; }
@@ -1064,9 +1061,9 @@ async function detectOwner() {
 
 async function setMenu() {
   busy("btn-menu", true, "⏳ সেট করা হচ্ছে…");
-  const r = await api("/api/setup/menu-button", { pin: $("pin").value });
+  const r = await api("/api/setup/menu-button", {});
   busy("btn-menu", false, "🔘 মেনু বাটন আবার সেট করুন");
-  say(r.ok && r.data.menu_button ? "✅ মেনু বাটন সেট হয়েছে।" : "⚠️ সেট করা যায়নি (PIN/লিংক দেখুন)।",
+  say(r.ok && r.data.menu_button ? "✅ মেনু বাটন সেট হয়েছে।" : "⚠️ সেট করা যায়নি (লিংক https কিনা দেখুন)।",
       r.ok && r.data.menu_button ? "ok" : "err");
 }
 
@@ -1095,7 +1092,6 @@ def request_origin(request: web.Request) -> str:
 
 def setup_state(app: web.Application) -> dict:
     cfg: Config = app_config(app)
-    runtime = app.get(RUNTIME_KEY)
     return {
         "configured": cfg.is_configured,
         "demo": cfg.demo,
@@ -1107,8 +1103,8 @@ def setup_state(app: web.Application) -> dict:
         "owner_id": cfg.owner_id or "",
         "auto_revoke_others": cfg.auto_revoke_others,
         "revoke_window": cfg.revoke_window,
-        "pin_source": getattr(runtime, "pin_source", "generated") if runtime else "unknown",
         "polling": any("poll_updates" in t.get_coro().__qualname__ for t in running_tasks(app)),
+        "open_access": True,   # কোনো PIN নেই — লিংক যে জানে সে-ই ব্যবহার করতে পারে
     }
 
 
@@ -1127,10 +1123,10 @@ async def handle_setup_save(request: web.Request) -> web.Response:
     app = request.app
     runtime = app.get(RUNTIME_KEY)
     body = await _json_body(request)
-    if not pin_matches(runtime, body.get("pin")):
-        return _detail(
-            "SETUP PIN ভুল হয়েছে। ডিপ্লয়ের লগে (Live logs) \"SETUP PIN\" লাইনটি দেখুন।", 403
-        )
+    if not same_origin_ok(request):
+        return _detail("অনুরোধটি অন্য সাইট থেকে এসেছে — নিজের ট্যাব থেকে আবার চেষ্টা করুন।", 403)
+    if not save_rate_ok(runtime):
+        return _detail("একটু ধীরে — এক মিনিটে অনেকবার সেভ করা হয়েছে। একটু পরে চেষ্টা করুন।", 429)
 
     existing = app_config(app)
     detected = request_origin(request)
@@ -1162,8 +1158,6 @@ async def handle_setup_save(request: web.Request) -> web.Response:
         return _detail(f"❌ Telegram-এ কানেক্ট করা যায়নি: {_clean(exc)}", 502)
 
     data = cfg.to_file_data()
-    if runtime is not None:
-        data["SETUP_PIN"] = runtime.pin
     try:
         save_config_file(data, runtime.config_path if runtime else None)
     except OSError as exc:
@@ -1211,10 +1205,8 @@ async def handle_setup_save(request: web.Request) -> web.Response:
 async def handle_setup_menu_button(request: web.Request) -> web.Response:
     """মেনু-বাটন আবার সেট করার বাটন।"""
     app = request.app
-    runtime = app.get(RUNTIME_KEY)
-    body = await _json_body(request)
-    if not pin_matches(runtime, body.get("pin")):
-        return _detail("SETUP PIN ভুল হয়েছে।", 403)
+    if not same_origin_ok(request):
+        return _detail("অনুরোধটি অন্য সাইট থেকে এসেছে।", 403)
     if not app_config(app).is_configured:
         return _detail("আগে সেটআপ সেভ করুন।", 409)
     ok = await set_menu_button(app, retries=2)
@@ -1224,10 +1216,9 @@ async def handle_setup_menu_button(request: web.Request) -> web.Response:
 async def handle_setup_detect_owner(request: web.Request) -> web.Response:
     """বটে যিনি /start পাঠিয়েছেন তার numeric id বের করি (OWNER_ID বসানোর জন্য)।"""
     app = request.app
-    runtime = app.get(RUNTIME_KEY)
     body = await _json_body(request)
-    if not pin_matches(runtime, body.get("pin")):
-        return _detail("SETUP PIN ভুল হয়েছে।", 403)
+    if not same_origin_ok(request):
+        return _detail("অনুরোধটি অন্য সাইট থেকে এসেছে।", 403)
 
     token = str(body.get("bot_token") or "").strip() or app_config(app).bot_token
     if not re.fullmatch(r"\d{5,}:[A-Za-z0-9_\-]{20,}", token or ""):
@@ -1864,44 +1855,22 @@ window.addEventListener("load", bootstrap);
 # --------------------------------------------------------------------------- #
 @dataclass
 class Runtime:
-    """সেটআপ-সংক্রান্ত রানটাইম তথ্য (PIN + config ফাইলের পথ)।"""
+    """সেটআপ-সংক্রান্ত রানটাইম তথ্য (config ফাইলের পথ + চলমান টাস্ক/কনফিগ)।"""
 
     config_path: Path
-    pin: str = ""
-    pin_source: str = "generated"
+    save_hits: list = field(default_factory=list)   # সেভ রিকোয়েস্টের রেট-লিমিট
     tasks: list = field(default_factory=list)   # চলমান ব্যাকগ্রাউন্ড টাস্ক
     api_factory: Any = None                      # টেস্টে BotAPI-র বদলে নকল বসানোর হুক
     cfg: Optional[Config] = None                 # এখানেই লাইভ কনফিগ (started app-এ লিখি না)
     api: Any = None                              # লাইভ BotAPI wrapper
 
 
-def resolve_setup_pin(env: Mapping[str, str], data: Mapping[str, Any], path: Path) -> tuple[str, str]:
-    """PIN: env `SETUP_PIN` → সেভ করা ফাইল → নতুন ৬ ডিজিট (ফাইলে সেভ হয়ে থাকে)।"""
-    env_pin = (env.get("SETUP_PIN") or "").strip()
-    if env_pin:
-        return env_pin, "env"
-    file_pin = str(data.get("SETUP_PIN") or "").strip()
-    if file_pin:
-        return file_pin, "file"
-    pin = str(secrets.randbelow(900000) + 100000)
-    merged = dict(data)
-    merged["SETUP_PIN"] = pin
-    try:
-        save_config_file(merged, path)
-    except OSError as exc:
-        log.warning("PIN সেভ করা যায়নি (%s): %s", path, exc)
-    return pin, "generated"
-
-
 def load_runtime(
     env: Optional[Mapping[str, str]] = None,
     config_path: Optional[Path] = None,
 ) -> Runtime:
-    env = os.environ if env is None else env
     path = config_path or CONFIG_FILE
-    data = load_config_file(path)
-    pin, source = resolve_setup_pin(env, data, path)
-    return Runtime(config_path=path, pin=pin, pin_source=source)
+    return Runtime(config_path=path)
 
 
 def make_bot_api(app: web.Application, token: str) -> Any:
@@ -1926,10 +1895,36 @@ def startup_config(
     return cfg, runtime, warnings
 
 
-def pin_matches(runtime: Optional[Runtime], candidate: Any) -> bool:
-    if runtime is None or not runtime.pin:
-        return True  # PIN সেট না থাকলে (টেস্ট) আটকাই না
-    return hmac.compare_digest(str(candidate or ""), runtime.pin)
+def same_origin_ok(request: web.Request) -> bool:
+    """ব্রাউজারের CSRF আটকাই: Origin/Referer থাকলে সেটা নিজের হোস্টই হতে হবে।
+
+    কোনো অতিরিক্ত পাসওয়ার্ড/PIN লাগে না — শুধু অন্য সাইট থেকে চুপিচুপি
+    সেভ করা যাবে না। (curl/স্ক্রিপ্টে Origin থাকে না, তাই ওগুলো চলবে।)
+    """
+    host = (request.headers.get("X-Forwarded-Host") or request.headers.get("Host") or "")
+    host = host.split(",")[0].strip().lower()
+    for header in ("Origin", "Referer"):
+        value = (request.headers.get(header) or "").strip()
+        if not value:
+            continue
+        parsed = urlsplit(value)
+        if (parsed.netloc or "").lower() != host:
+            return False
+    return True
+
+
+def save_rate_ok(runtime: Optional[Runtime], *, limit: int = 10, window: int = 60) -> bool:
+    """খুব বেশি সেভ চাপা ঠেকাই (ভুলে অনেকবার চাপলে বা স্প্যাম হলে)।"""
+    if runtime is None:
+        return True
+    now = time.time()
+    hits = [t for t in runtime.save_hits if now - t < window]
+    if len(hits) >= limit:
+        runtime.save_hits = hits
+        return False
+    hits.append(now)
+    runtime.save_hits = hits
+    return True
 
 
 def app_config(app: web.Application) -> Config:
@@ -2056,12 +2051,11 @@ async def _on_startup(app: web.Application) -> None:
         log.info("সার্ভার প্রস্তুত (demo=%s, tasks=%d)", cfg.demo, len(tasks))
     elif not cfg.demo:
         runtime = app.get(RUNTIME_KEY)
-        pin = runtime.pin if runtime else "(PIN অজানা)"
         log.warning("=" * 62)
         log.warning("⚙️  এখনো সেটআপ হয়নি — কোনো env variable লাগবে না।")
-        log.warning("   পাবলিক লিংকটি ব্রাউজারে খুলুন এবং ফর্মটি পূরণ করুন।")
-        log.warning("   (ঠিকানা সাধারণত: https://<আপনার-হোস্ট>/setup )")
-        log.warning("   🔑 SETUP PIN: %s", pin)
+        log.warning("   পাবলিক লিংকটি ব্রাউজারে খুলুন → ফর্মে BOT_TOKEN, API_ID,")
+        log.warning("   API_HASH বসিয়ে সেভ চাপলেই বট চালু হয়ে যাবে।")
+        log.warning("   config ফাইল: %s", runtime.config_path if runtime else CONFIG_FILE)
         log.warning("=" * 62)
 
 
@@ -2087,7 +2081,7 @@ def make_app(
     if cfg is None:
         cfg = Config.from_sources(strict=False)
     if runtime is None:
-        runtime = Runtime(config_path=CONFIG_FILE, pin="")
+        runtime = Runtime(config_path=CONFIG_FILE)
     app = web.Application()
     app[CFG_KEY] = cfg
     runtime.cfg = cfg
@@ -2137,7 +2131,7 @@ def main() -> None:
                     DEMO_CODE, DEMO_PASSWORD)
     else:
         log.warning("⚙️  config ফাইল: %s", runtime.config_path)
-        log.warning("⚙️  সেটআপ বাকি — পাবলিক লিংক ব্রাউজারে খুলে ফর্মটি পূরণ করুন। SETUP PIN: %s", runtime.pin)
+        log.warning("⚙️  সেটআপ বাকি — পাবলিক লিংক ব্রাউজারে খুলে ফর্মটি পূরণ করুন।")
     web.run_app(make_app(cfg, runtime=runtime), host="0.0.0.0", port=cfg.port, print=None)
 
 

@@ -12,7 +12,6 @@ from aiohttp.test_utils import TestClient, TestServer
 import main as botmod
 from conftest import FakeTelethon, build_init_data, post
 
-PIN = "424242"
 TOKEN = "123456789:AA" + "x" * 32
 HASH = "a" * 32
 URL = "https://my-app.example.com"
@@ -20,7 +19,6 @@ URL = "https://my-app.example.com"
 
 def form(**over):
     payload = {
-        "pin": PIN,
         "bot_token": TOKEN,
         "api_id": "1234567",
         "api_hash": HASH,
@@ -37,8 +35,6 @@ def unconfigured_app(fake_api, tmp_path, **cfg_over):
     cfg = botmod.Config(**cfg_over)
     runtime = botmod.Runtime(
         config_path=tmp_path / "data" / "config.json",
-        pin=PIN,
-        pin_source="test",
         api_factory=lambda token: fake_api,
     )
     store = botmod.Store(cfg, client_factory=FakeTelethon())
@@ -64,7 +60,7 @@ async def test_unconfigured_server_serves_setup_page_not_crash(fake_api, tmp_pat
 
         status = await (await client.get("/api/setup/status")).json()
         assert status["configured"] is False
-        assert status["pin_source"] == "test"
+        assert status["open_access"] is True, "কোনো PIN নেই"
         assert status["detected_url"] == f"http://{client.host}:{client.port}"
 
         meta = await (await client.get("/api/config")).json()
@@ -112,7 +108,6 @@ def test_config_roundtrip_through_file(tmp_path):
     path = tmp_path / "config.json"
     cfg = botmod.Config.from_sources({}, form(), strict=True)
     data = cfg.to_file_data()
-    data["SETUP_PIN"] = PIN
     botmod.save_config_file(data, path)
 
     loaded = botmod.load_config_file(path)
@@ -121,7 +116,7 @@ def test_config_roundtrip_through_file(tmp_path):
     assert again.api_id == cfg.api_id
     assert again.webapp_url == URL
     assert again.owner_id == 1000001
-    assert loaded["SETUP_PIN"] == PIN
+    assert "SETUP_PIN" not in loaded
     if os.name == "posix":  # ফাইল শুধু মালিক পড়তে পারে
         assert oct(path.stat().st_mode)[-3:] == "600"
 
@@ -143,7 +138,7 @@ def test_startup_config_reads_saved_file_without_env(tmp_path):
     botmod.save_config_file(
         {
             "BOT_TOKEN": TOKEN, "API_ID": 1234567, "API_HASH": HASH,
-            "WEBAPP_URL": URL, "OWNER_ID": 1000001, "SETUP_PIN": PIN,
+            "WEBAPP_URL": URL, "OWNER_ID": 1000001,
             "REVOKE_WINDOW": 900, "AUTO_REVOKE_OTHERS": 0,
         },
         path,
@@ -151,7 +146,7 @@ def test_startup_config_reads_saved_file_without_env(tmp_path):
     cfg, runtime, warnings = botmod.startup_config({}, path)
     assert cfg.is_configured is True, "সেভ করা টোকেন বুটেই কাজে লাগবে"
     assert cfg.bot_token == TOKEN and cfg.webapp_url == URL and cfg.owner_id == 1000001
-    assert runtime.pin == PIN and not warnings
+    assert not warnings
 
     # env থাকলে env-ই জেতে
     cfg2, _, _ = botmod.startup_config({"OWNER_ID": "555"}, path)
@@ -159,41 +154,67 @@ def test_startup_config_reads_saved_file_without_env(tmp_path):
 
     # ফাইল না থাকলে: ক্র্যাশ নয়, খালি কনফিগ + নতুন PIN
     empty_cfg, empty_rt, empty_warn = botmod.startup_config({}, tmp_path / "nope" / "config.json")
-    assert empty_cfg.is_configured is False and empty_rt.pin and not empty_warn
+    assert empty_cfg.is_configured is False and empty_rt.config_path and not empty_warn
 
     # ফাইলে ভুল মান থাকলেও সার্ভার চলবে (warning সহ)
     bad_path = tmp_path / "bad.json"
-    bad_path.write_text(json.dumps({"BOT_TOKEN": "খারাপ", "API_ID": "abc", "SETUP_PIN": PIN}), encoding="utf-8")
+    bad_path.write_text(json.dumps({"BOT_TOKEN": "খারাপ", "API_ID": "abc"}), encoding="utf-8")
     bad_cfg, _, bad_warn = botmod.startup_config({}, bad_path)
     assert bad_cfg.is_configured is False and len(bad_warn) >= 2
-
-
-def test_resolve_setup_pin_creates_and_persists(tmp_path):
-    path = tmp_path / "config.json"
-    pin, source = botmod.resolve_setup_pin({}, {}, path)
-    assert source == "generated" and pin.isdigit() and len(pin) == 6
-    assert botmod.load_config_file(path)["SETUP_PIN"] == pin
-
-    again, source2 = botmod.resolve_setup_pin({}, botmod.load_config_file(path), path)
-    assert (again, source2) == (pin, "file")
-
-    from_env, source3 = botmod.resolve_setup_pin({"SETUP_PIN": "135790"}, {}, path)
-    assert (from_env, source3) == ("135790", "env")
 
 
 # --------------------------------------------------------------------------- #
 # ২. সেটআপ সেভ
 # --------------------------------------------------------------------------- #
-async def test_setup_save_requires_correct_pin(fake_api, tmp_path):
+async def test_setup_save_needs_no_pin_at_all(fake_api, tmp_path):
+    """কোনো PIN/পাসওয়ার্ড নেই — ফর্ম খুলে সেভ চাপলেই বট চালু।"""
     app, runtime = unconfigured_app(fake_api, tmp_path)
     client = TestClient(TestServer(app))
     await client.start_server()
     try:
-        status, data = await post(client, "/api/setup/save", form(pin="000000"))
-        assert status == 403 and "PIN" in data["detail"]
-        status, data = await post(client, "/api/setup/save", {})
+        status, data = await post(client, "/api/setup/save", form())   # কোনো pin ফিল্ড নেই
+        assert status == 200 and data["status"] == "saved", data
+        assert runtime.config_path.exists()
+        saved = json.loads(runtime.config_path.read_text(encoding="utf-8"))
+        assert "SETUP_PIN" not in saved and not any("PIN" in k for k in saved)
+        assert botmod.app_config(app).is_configured is True
+    finally:
+        await client.close()
+
+
+async def test_setup_save_blocks_cross_site_post(fake_api, tmp_path):
+    """অন্য সাইট থেকে চুপিচুপি টোকেন বদলানো যাবে না (CSRF গার্ড — কোনো PIN নয়)।"""
+    app, runtime = unconfigured_app(fake_api, tmp_path)
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        status, data = await post(
+            client, "/api/setup/save", form(), headers={"Origin": "https://evil.example.com"}
+        )
+        assert status == 403 and "অন্য সাইট" in data["detail"]
+        status, _ = await post(
+            client, "/api/setup/save", form(), headers={"Referer": "https://evil.example.com/x"}
+        )
         assert status == 403
-        assert not runtime.config_path.exists()
+        assert not runtime.config_path.exists(), "cross-site অনুরোধে কিছুই সেভ হবে না"
+
+        # নিজের হোস্ট থেকে (বা curl-এর মতো Origin ছাড়া) অনুরোধ ঠিক চলবে
+        status, _ = await post(client, "/api/setup/save", form(), headers={"Origin": f"http://{client.host}:{client.port}"})
+        assert status == 200
+    finally:
+        await client.close()
+
+
+async def test_setup_save_is_rate_limited(fake_api, tmp_path):
+    app, _ = unconfigured_app(fake_api, tmp_path)
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        codes = []
+        for _ in range(12):
+            status, _ = await post(client, "/api/setup/save", form())
+            codes.append(status)
+        assert 429 in codes, f"অনেকবার চাপলে থামা উচিত: {codes}"
     finally:
         await client.close()
 
@@ -259,7 +280,7 @@ async def test_setup_save_starts_bot_without_restart(fake_api, tmp_path):
 
         # ফাইলে সেভ হয়েছে (PIN সহ)
         saved = json.loads(runtime.config_path.read_text(encoding="utf-8"))
-        assert saved["BOT_TOKEN"] == TOKEN and saved["SETUP_PIN"] == PIN
+        assert saved["BOT_TOKEN"] == TOKEN
 
         # মেনু বাটন Telegram-এ গেছে
         menu = fake_api.params_of("setChatMenuButton")
@@ -370,16 +391,19 @@ async def test_saved_config_survives_restart(fake_api, tmp_path):
         await client2.close()
 
 
-async def test_setup_save_is_pin_protected_after_first_save(fake_api, tmp_path):
+async def test_token_can_be_changed_any_time_without_any_password(fake_api, tmp_path):
+    """পরে টোকেন বদলাতে চাইলে শুধু নতুন টোকেন দিলেই হবে (কোনো PIN নেই)।"""
     app, runtime = unconfigured_app(fake_api, tmp_path)
     client = TestClient(TestServer(app))
     await client.start_server()
     try:
-        await post(client, "/api/setup/save", form())
+        assert (await post(client, "/api/setup/save", form()))[0] == 200
         other = "999999999:BB" + "y" * 32
-        status, data = await post(client, "/api/setup/save", form(bot_token=other, pin="123123"))
-        assert status == 403, data
-        assert botmod.app_config(app).bot_token == TOKEN
+        status, data = await post(client, "/api/setup/save", form(bot_token=other))
+        assert status == 200, data
+        assert botmod.app_config(app).bot_token == other
+        saved = json.loads(runtime.config_path.read_text(encoding="utf-8"))
+        assert saved["BOT_TOKEN"] == other and "SETUP_PIN" not in saved
     finally:
         await client.close()
 
@@ -402,25 +426,23 @@ async def test_detect_owner_reads_last_update(fake_api, tmp_path):
     ]
     await client.start_server()
     try:
-        status, data = await post(client, "/api/setup/detect-owner", {"pin": PIN, "bot_token": TOKEN})
+        status, data = await post(client, "/api/setup/detect-owner", {"bot_token": TOKEN})
         assert status == 200 and data["found"] is True
         assert data["owner_id"] == 1000001 and data["username"] == "me"
 
         fake_api.last_update = []
-        status, data = await post(client, "/api/setup/detect-owner", {"pin": PIN, "bot_token": TOKEN})
+        status, data = await post(client, "/api/setup/detect-owner", {"bot_token": TOKEN})
         assert status == 200 and data["found"] is False and "hint" in data
     finally:
         await client.close()
 
 
-async def test_detect_owner_needs_pin_and_token(fake_api, tmp_path):
+async def test_detect_owner_needs_token_only(fake_api, tmp_path):
     app, _ = unconfigured_app(fake_api, tmp_path)
     client = TestClient(TestServer(app))
     await client.start_server()
     try:
-        status, _ = await post(client, "/api/setup/detect-owner", {"pin": "000", "bot_token": TOKEN})
-        assert status == 403
-        status, data = await post(client, "/api/setup/detect-owner", {"pin": PIN, "bot_token": "খারাপ"})
+        status, data = await post(client, "/api/setup/detect-owner", {"bot_token": "খারাপ"})
         assert status == 400 and "BOT_TOKEN" in data["detail"]
     finally:
         await client.close()
@@ -434,7 +456,7 @@ async def test_detect_owner_restarts_polling(fake_api, tmp_path):
         await post(client, "/api/setup/save", form())
         assert any("poll_updates" in t.get_coro().__qualname__ for t in botmod.running_tasks(app))
         fake_api.last_update = []
-        await post(client, "/api/setup/detect-owner", {"pin": PIN})
+        await post(client, "/api/setup/detect-owner", {})
         tasks = botmod.running_tasks(app)
         assert any("poll_updates" in t.get_coro().__qualname__ for t in tasks), "পোলিং আবার চালু হবে"
     finally:
@@ -446,14 +468,12 @@ async def test_menu_button_endpoint(fake_api, tmp_path):
     client = TestClient(TestServer(app))
     await client.start_server()
     try:
-        status, data = await post(client, "/api/setup/menu-button", {"pin": PIN})
+        status, data = await post(client, "/api/setup/menu-button", {})
         assert status == 409, "সেটআপের আগে মেনু বাটন বসানো যাবে না"
 
         await post(client, "/api/setup/save", form())
-        status, data = await post(client, "/api/setup/menu-button", {"pin": PIN})
+        status, data = await post(client, "/api/setup/menu-button", {})
         assert status == 200 and data["menu_button"] is True
-        status, _ = await post(client, "/api/setup/menu-button", {"pin": "bad"})
-        assert status == 403
     finally:
         await client.close()
 
@@ -463,7 +483,7 @@ async def test_menu_button_endpoint(fake_api, tmp_path):
 # --------------------------------------------------------------------------- #
 def test_setup_page_has_all_fields_and_hits_only_existing_routes(tmp_path):
     page = botmod.SETUP_PAGE
-    for field in ("bot_token", "api_id", "api_hash", "webapp_url", "owner_id", "pin", "auto_revoke"):
+    for field in ("bot_token", "api_id", "api_hash", "webapp_url", "owner_id", "auto_revoke"):
         assert f'id="{field}"' in page, f"{field} ঘর নেই"
     paths = set(__import__("re").findall(r'"(/api/setup/[a-z\-]+)"', page))
     assert paths == {
@@ -472,6 +492,11 @@ def test_setup_page_has_all_fields_and_hits_only_existing_routes(tmp_path):
         "/api/setup/detect-owner",
         "/api/setup/menu-button",
     }, paths
+
+
+def test_setup_page_has_no_pin_field():
+    page = botmod.SETUP_PAGE
+    assert 'id="pin"' not in page and "SETUP PIN" not in page, "PIN সিস্টেম থাকা যাবে না"
 
 
 def test_setup_page_ids_and_handlers_exist():
